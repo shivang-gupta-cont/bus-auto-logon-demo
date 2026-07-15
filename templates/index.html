@@ -1,0 +1,1272 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Bus Stop Grid Explorer</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css"/>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css"/>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <style>
+    .nav-score {
+      margin-top: 4px;
+      font-size: 11px;
+      font-weight: 700;
+      padding: 2px 6px;
+      border-radius: 6px;
+      white-space: nowrap;
+    }
+    .nav-score-pending { color: #92400e; background: #fef3c7; }
+    .nav-score-ok      { color: #166534; background: #dcfce7; }
+    .nav-score-none    { color: #64748b; background: #f1f5f9; }
+  </style>
+</head>
+<body>
+
+<div id="header">
+  <h1>Bus Stop Grid Explorer</h1>
+  <span class="stat-pill">Service day: <b>{{ service_day }}</b></span>
+  <span class="stat-pill">Stops: <b>{{ total_stops }}</b></span>
+  <span class="stat-pill">Cells: <b>{{ total_cells }}</b></span>
+  <span class="stat-pill veh-pill">
+    Vehicle <b>{{ veh_techvhno }}</b> · Block <b>{{ veh_blockid }}</b> · Trip <b>{{ veh_tripid }}</b>
+    <span class="veh-count">{{ veh_points }} pts</span>
+  </span>
+  <div class="spacer"></div>
+  <button id="toggle-vehicle" onclick="toggleVehicle()">Hide vehicle</button>
+  <button id="toggle-stops"   onclick="toggleStops()">Hide stops</button>
+</div>
+
+<div id="body">
+  <div id="map"></div>
+
+  <div id="panel">
+    <div id="panel-header">
+      <span id="panel-breadcrumb" onclick="backToCell()" title="Back to cell"></span>
+      <span id="panel-title">Details</span>
+      <button id="panel-close" onclick="closePanel()">×</button>
+    </div>
+    <div id="panel-body">
+      <div class="state-box">
+        <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="#334155" stroke-width="1.5">
+          <rect x="3" y="3" width="18" height="18" rx="2"/>
+          <path d="M3 9h18M9 21V9"/>
+        </svg>
+        Click a grid cell to begin
+      </div>
+    </div>
+  </div>
+
+  <div id="loading-overlay">
+    <div class="spinner"></div>
+    Loading map data…
+  </div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
+<script>
+
+// ── constants ─────────────────────────────────────────────────────────────────
+
+const KM_LAT = 1 / 111.0;
+const KM_LON = 1 / (111.0 * Math.cos({{ center_lat }} * Math.PI / 180));
+
+const STYLE_NORMAL           = { radius: 5, color: "#1F4E5C", fillColor: "#38bdf8", fillOpacity: 0.85, weight: 1 };
+const STYLE_DIMMED           = { radius: 3, color: "#1e293b", fillColor: "#334155", fillOpacity: 0.3,  weight: 0.5 };
+const STYLE_IN_CELL          = { radius: 7, color: "#0e7490", fillColor: "#7dd3fc", fillOpacity: 1.0,  weight: 2 };
+const STYLE_SELECTED_ACTIVE  = { radius: 9, color: "#c2410c", fillColor: "#fb923c", fillOpacity: 1.0,  weight: 2.5 };
+const STYLE_SELECTED_INACTIVE= { radius: 8, color: "#92400e", fillColor: "#d97706", fillOpacity: 0.85, weight: 2 };
+
+const CELL_STYLE_NORMAL   = c => ({ weight: 0.5, color: "#1F4E5C", fillColor: c, fillOpacity: 0.55 });
+const CELL_STYLE_SELECTED = c => ({ weight: 3.5, color: "#0f172a", fillColor: c, fillOpacity: 0.7 });
+
+const ROUTE_COLORS = [
+  "#e63946","#2a9d8f","#f4a261","#6a4c93",
+  "#1982c4","#8ac926","#ff6b6b","#ffd166",
+  "#06d6a0","#ff9f1c","#b5179e","#4361ee",
+];
+
+// Torch beam — how the directional cone is drawn (independent of shapepoint/stoppoint logic).
+// Multiple stacked fan layers, decreasing radius + increasing opacity, give a fade-out look.
+const TORCH_SPREAD_DEG = 45;
+const TORCH_COLOR      = "#ffe139";
+const TORCH_LAYERS = [
+  { radius: 200, opacity: 0.26 },
+];
+
+// Nearest-shapepoint search constraints (independent constants, tweak freely).
+const NEAREST_MAX_COUNT    = 50;   // never return more than this many shapepoints
+const NEAREST_MAX_DIST_M   = 200;  // ignore shapepoints farther than this
+const NEAREST_BEARING_HALF = 45;   // shapepoint bearing must fall within compass ± this value
+
+// Nearby-stops highlight constraints (independent of shapepoint search — looks at bus
+// STOP points, not route shapepoints; no bearing constraint, just straight-line distance).
+const STOP_NEARBY_MAX_DIST_M = 100;   // highlight stops within this many metres of the vehicle
+const STOP_NEARBY_COLOR      = "#ec4899";
+
+// Vehicle trip-scoring constraints — how many of the ranked nearest shapepoints get sent
+// to the server for trip/block scoring. Independent of NEAREST_MAX_COUNT (which controls
+// what's drawn on the map); scoring is capped lower to keep each DB round-trip fast.
+const SCORE_MAX_GROUPS = 15;
+
+// ── map ───────────────────────────────────────────────────────────────────────
+
+const map = L.map("map", { zoomControl: true }).setView([{{ center_lat }}, {{ center_lon }}], 13);
+L.tileLayer("https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png", {
+  attribution: "© OpenStreetMap © CARTO", maxZoom: 19,
+}).addTo(map);
+
+// ── layers (z-order: grid → vehicle route → nearest → torch beam → nearby stops → current pos)
+
+let gridLayer        = L.layerGroup().addTo(map);
+let vehicleLayer     = L.layerGroup().addTo(map);   // full route polyline + all dots
+let nearestLayer     = L.layerGroup().addTo(map);   // nearest shape point + connecting line
+let torchLayer       = L.layerGroup().addTo(map);   // directional beam, drawn just under the vehicle dot
+let nearbyStopsLayer = L.layerGroup().addTo(map);   // stop points within 100m of the vehicle
+let currentPosLayer  = L.layerGroup().addTo(map);   // current vehicle position (always on top)
+let stopsCluster     = L.markerClusterGroup({ maxClusterRadius: 40, disableClusteringAtZoom: 16 });
+let individualLayer  = L.layerGroup();
+
+// ── state ─────────────────────────────────────────────────────────────────────
+
+let allStopData   = [];
+let stopMarkerMap = {};
+let cellColorMap  = {};    // "row_col" → fill color — ALL cells with stop points
+let selectedCell  = null;
+
+let selectedStops     = new Map();
+let activePanelStopId = null;
+
+let stopsVisible   = true;
+let vehicleVisible = true;
+
+// vehicle navigator state
+let vehiclePoints = [];   // [{id,time,datetime,lat,lon,compass,routeid}] sorted by time
+let vehicleIndex  = 0;
+let vehicleId     = null;
+
+// grid shapepoints data structure
+// populated based on the vehicle's current grid cell (not the clicked cell)
+// { cell: {row,col,...}, total, points: [{id,lat,lon}], byId: Map }
+let gridShapePoints = null;
+
+// nearest shape point result
+// { shapepoint: {id,lat,lon}, distanceM: float }
+let nearestShapepoint = null;
+
+// vehicle trip/block scoring result for the current position
+// { reference_time, compass, trips: [...], blocks: [...] }
+let vehicleScoreResult = null;
+let vehicleScoreRequestId = 0;   // guards against out-of-order responses while navigating fast
+
+// ── helpers ───────────────────────────────────────────────────────────────────
+
+function isInCell(stop, cell) {
+  return stop.lat >= cell.south && stop.lat < cell.north &&
+         stop.lon >= cell.west  && stop.lon < cell.east;
+}
+function nextRouteColor(routesMap) {
+  const used = new Set([...routesMap.values()].map(e => e.color));
+  return ROUTE_COLORS.find(c => !used.has(c)) || ROUTE_COLORS[routesMap.size % ROUTE_COLORS.length];
+}
+function activeStopRoutes() {
+  return selectedStops.get(activePanelStopId)?.routes || new Map();
+}
+
+// Haversine distance in metres between two lat/lon degree points
+function haversineMeters(lat1, lon1, lat2, lon2) {
+  const R  = 6_371_000;
+  const φ1 = lat1 * Math.PI / 180;
+  const φ2 = lat2 * Math.PI / 180;
+  const Δφ = (lat2 - lat1) * Math.PI / 180;
+  const Δλ = (lon2 - lon1) * Math.PI / 180;
+  const a  = Math.sin(Δφ / 2) ** 2 +
+              Math.cos(φ1) * Math.cos(φ2) * Math.sin(Δλ / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+// Initial bearing (azimuth, degrees 0-360) from point 1 to point 2.
+// Used to check whether a shapepoint lies within the vehicle's heading cone.
+function bearingDegrees(lat1, lon1, lat2, lon2) {
+  const φ1 = lat1 * Math.PI / 180;
+  const φ2 = lat2 * Math.PI / 180;
+  const Δλ = (lon2 - lon1) * Math.PI / 180;
+  const y = Math.sin(Δλ) * Math.cos(φ2);
+  const x = Math.cos(φ1) * Math.sin(φ2) - Math.sin(φ1) * Math.cos(φ2) * Math.cos(Δλ);
+  const θ = Math.atan2(y, x) * 180 / Math.PI;
+  return (θ + 360) % 360;
+}
+
+// Smallest absolute angular difference between two bearings (0-180 range).
+// Handles wraparound, e.g. diff(350, 10) === 20, not 340.
+function angleDiff(a, b) {
+  const diff = Math.abs(a - b) % 360;
+  return diff > 180 ? 360 - diff : diff;
+}
+
+// Given a start point, bearing (deg) and distance (m), returns the destination [lat, lon].
+// Used only for drawing the torch beam — has no relation to shapepoint/stoppoint logic.
+function destPoint(lat, lon, bearingDeg, distM) {
+  const R  = 6_371_000;
+  const δ  = distM / R;
+  const θ  = bearingDeg * Math.PI / 180;
+  const φ1 = lat * Math.PI / 180, λ1 = lon * Math.PI / 180;
+  const φ2 = Math.asin(Math.sin(φ1) * Math.cos(δ) + Math.cos(φ1) * Math.sin(δ) * Math.cos(θ));
+  const λ2 = λ1 + Math.atan2(
+    Math.sin(θ) * Math.sin(δ) * Math.cos(φ1),
+    Math.cos(δ) - Math.sin(φ1) * Math.sin(φ2)
+  );
+  return [φ2 * 180 / Math.PI, λ2 * 180 / Math.PI];
+}
+
+// Builds a fan/cone polygon centred at (lat,lon), spanning [compass-spread, compass+spread].
+function buildFanPoints(lat, lon, compassDeg, radiusM, spreadDeg = TORCH_SPREAD_DEG, steps = 24) {
+  const points = [[lat, lon]];
+  const start  = compassDeg - spreadDeg;
+  const end    = compassDeg + spreadDeg;
+  for (let i = 0; i <= steps; i++) {
+    const bearing = start + (end - start) * (i / steps);
+    points.push(destPoint(lat, lon, bearing, radiusM));
+  }
+  points.push([lat, lon]);
+  return points;
+}
+
+// Draws (or clears) the vehicle's directional torch beam for the given position.
+// Purely a visual/orientation aid — independent of the grid/shapepoint/stoppoint system.
+function updateTorchBeam(p) {
+  torchLayer.clearLayers();
+
+  if (p.compass === null || p.compass === undefined) return; // no heading — nothing to draw
+
+  TORCH_LAYERS.forEach(({ radius, opacity }) => {
+    const pts = buildFanPoints(p.lat, p.lon, p.compass, radius);
+    L.polygon(pts, {
+      color: "transparent",
+      fillColor: TORCH_COLOR,
+      fillOpacity: opacity,
+      weight: 0,
+      interactive: false,
+    }).addTo(torchLayer);
+  });
+}
+
+// Highlights bus stop points within STOP_NEARBY_MAX_DIST_M metres of the vehicle's
+// current position, with the live distance shown as a floating label + tooltip.
+// Independent of the shapepoint nearest-search — this looks at allStopData (stops),
+// not gridShapePoints (shapepoints), and uses plain distance with no bearing cone.
+function updateNearbyStops(p) {
+  nearbyStopsLayer.clearLayers();
+
+  if (!allStopData || allStopData.length === 0) return;
+
+  const nearby = allStopData
+    .map(s => ({ s, dist: haversineMeters(p.lat, p.lon, s.lat, s.lon) }))
+    .filter(({ dist }) => dist <= STOP_NEARBY_MAX_DIST_M)
+    .sort((a, b) => a.dist - b.dist);
+
+  nearby.forEach(({ s, dist }) => {
+    // highlighted stop dot
+    L.circleMarker([s.lat, s.lon], {
+      radius: 8,
+      color: "#831843",
+      fillColor: STOP_NEARBY_COLOR,
+      fillOpacity: 0.95,
+      weight: 2.5,
+    })
+    .bindTooltip(
+      `<b>Stop ${s.id}</b><br>Distance: <b>${dist.toFixed(1)} m</b>`,
+      { sticky: true }
+    )
+    .addTo(nearbyStopsLayer);
+
+    // floating distance badge next to the dot
+    L.marker([s.lat, s.lon], {
+      icon: L.divIcon({
+        className: "",
+        html: `<span style="background:${STOP_NEARBY_COLOR};color:#4a044e;font-size:10px;` +
+              `font-weight:700;padding:1px 5px;border-radius:8px;white-space:nowrap;` +
+              `box-shadow:0 1px 3px rgba(0,0,0,0.25);pointer-events:none;">` +
+              `${dist.toFixed(0)}m</span>`,
+        iconAnchor: [-12, 16],
+      }),
+      interactive: false,
+    }).addTo(nearbyStopsLayer);
+  });
+
+  if (nearby.length > 0) {
+    console.log(
+      `%c[nearby stops] ${nearby.length} stop(s) within ${STOP_NEARBY_MAX_DIST_M}m of vehicle`,
+      "color:#ec4899;font-weight:bold;"
+    );
+    console.log(nearby);
+  }
+}
+
+// Returns {row, col} of the grid cell the vehicle currently occupies,
+// or null if the vehicle is not within any displayed grid cell.
+function vehicleGridCell() {
+  if (vehiclePoints.length === 0) return null;
+  const p   = vehiclePoints[vehicleIndex];
+  const row = Math.floor(p.lat / KM_LAT);
+  const col = Math.floor(p.lon / KM_LON);
+  // cellColorMap contains only cells that have stop points (loaded via /api/grid)
+  return cellColorMap[`${row}_${col}`] !== undefined ? { row, col } : null;
+}
+
+// ── vehicle navigator Leaflet control ─────────────────────────────────────────
+
+const VehicleNavControl = L.Control.extend({
+  options: { position: 'bottomright' },
+  onAdd(map) {
+    const c = L.DomUtil.create('div', 'vehicle-nav-control');
+    c.innerHTML = `
+      <button class="nav-btn" id="nav-back" disabled title="Previous position">&#8592;</button>
+      <div class="nav-info">
+        <div class="nav-label">Vehicle <b id="nav-veh-id">—</b></div>
+        <div id="nav-time"    class="nav-time">—</div>
+        <div id="nav-idx"     class="nav-index">— / —</div>
+        <div id="nav-compass" class="nav-compass">Compass: —</div>
+        <div id="nav-score"   class="nav-score">Best match: —</div>
+      </div>
+      <button class="nav-btn" id="nav-forward" disabled title="Next position">&#8594;</button>
+    `;
+    L.DomEvent.disableClickPropagation(c);
+    L.DomEvent.disableScrollPropagation(c);
+    c.querySelector('#nav-back').addEventListener('click',    () => navigateVehicle(-1));
+    c.querySelector('#nav-forward').addEventListener('click', () => navigateVehicle(+1));
+
+    // Keyboard navigation (Left/Right arrow keys)
+    this._onKeyDown = (e) => {
+      // Avoid hijacking arrow keys while typing in an input/textarea
+      const tag = document.activeElement && document.activeElement.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+
+      if (e.key === 'ArrowLeft') {
+        e.preventDefault();
+        navigateVehicle(-1);
+      } else if (e.key === 'ArrowRight') {
+        e.preventDefault();
+        navigateVehicle(+1);
+      }
+    };
+    document.addEventListener('keydown', this._onKeyDown);
+
+    return c;
+  },
+  onRemove(map) {
+    document.removeEventListener('keydown', this._onKeyDown);
+  },
+});
+
+new VehicleNavControl().addTo(map);
+
+// ── navigator functions ───────────────────────────────────────────────────────
+
+function navigateVehicle(delta) {
+  const next = vehicleIndex + delta;
+  if (next < 0 || next >= vehiclePoints.length) return;
+  vehicleIndex = next;
+  updateCurrentPosition();
+
+  // vehicle position changed → find nearest shape point in vehicle's current cell
+  updateVehicleGridAndNearest();
+}
+
+function updateCurrentPosition() {
+  if (vehiclePoints.length === 0) return;
+  const p = vehiclePoints[vehicleIndex];
+
+  currentPosLayer.clearLayers();
+  updateTorchBeam(p);     // directional beam, redrawn independently of shapepoint/stoppoint logic
+  updateNearbyStops(p);   // stops within 100m, redrawn independently of shapepoint/stoppoint logic
+
+  // outer ring
+  L.circleMarker([p.lat, p.lon], {
+    radius: 14, color: "#fbbf24", fillColor: "transparent", weight: 2, opacity: 0.45,
+  }).addTo(currentPosLayer);
+
+  // main dot
+  L.circleMarker([p.lat, p.lon], {
+    radius: 9, color: "#b45309", fillColor: "#fef08a", fillOpacity: 1.0, weight: 2.5,
+  })
+  .bindTooltip(
+    `<b>Vehicle ${p.techvhno ?? vehicleId}</b><br>` +
+    `Block:&nbsp;&nbsp; <b>${p.blockid  ?? '—'}</b><br>` +
+    `Trip:&nbsp;&nbsp;&nbsp; <b>${p.tripid   ?? '—'}</b><br>` +
+    `Route:&nbsp;&nbsp; <b>${p.routeid  ?? '—'}</b><br>` +
+    `Time:&nbsp;&nbsp;&nbsp; ${p.time}<br>` +
+    `Lat:&nbsp;&nbsp;&nbsp;&nbsp; ${p.lat.toFixed(6)}°<br>` +
+    `Lon:&nbsp;&nbsp;&nbsp;&nbsp; ${p.lon.toFixed(6)}°<br>` +
+    `Compass: ${p.compass ?? 'N/A'}°`,
+    { sticky: true, permanent: false }
+  )
+  .addTo(currentPosLayer);
+
+  document.getElementById("nav-veh-id").textContent  = vehicleId ?? "—";
+  document.getElementById("nav-time").textContent     = p.time;
+  document.getElementById("nav-idx").textContent      = `${vehicleIndex + 1} / ${vehiclePoints.length}`;
+  document.getElementById("nav-compass").textContent  = `Compass: ${p.compass ?? "N/A"}°`;
+  document.getElementById("nav-back").disabled        = vehicleIndex === 0;
+  document.getElementById("nav-forward").disabled     = vehicleIndex === vehiclePoints.length - 1;
+
+  // scoring for this position hasn't run yet (nearest search + DB round-trip is async)
+  setScoreDisplay(null, "pending");
+}
+
+// ── vehicle grid + nearest shape point ───────────────────────────────────────
+
+async function updateVehicleGridAndNearest() {
+  try {
+    const vc = vehicleGridCell();
+
+    if (!vc) {
+      // vehicle is not inside any displayed grid cell
+      gridShapePoints   = { cell: null, total: 0, points: [], byId: new Map() };
+      nearestShapepoint = null;
+      nearestLayer.clearLayers();
+      console.log("[gridShapePoints] vehicle not in any grid cell — storage empty");
+      clearVehicleScore("no grid cell");
+      return;
+    }
+
+    // only reload if vehicle moved to a different cell
+    const sameCell = gridShapePoints?.cell?.row === vc.row &&
+                     gridShapePoints?.cell?.col === vc.col;
+
+    if (!sameCell) {
+      await loadGridShapePoints(vc);   // awaited here so nearest runs after load
+    }
+
+    findNearestShapepointToVehicle();
+
+  } catch (err) {
+    console.error("[updateVehicleGridAndNearest] error:", err);
+  }
+}
+
+async function loadGridShapePoints(cell) {
+  try {
+    const res  = await fetch(`/api/grid-shapepoints?row=${cell.row}&col=${cell.col}`);
+    const data = await res.json();
+
+    gridShapePoints = {
+      cell:   data.cell,
+      total:  data.total,
+      points: data.points,
+      byId:   new Map(data.points.map(p => [p.id, p])),
+    };
+
+    // ── log 1: summary ───────────────────────────────────────────
+    console.log(
+      `%c[gridShapePoints] vehicle cell (${cell.row},${cell.col}) → ${gridShapePoints.total} shape points ready`,
+      "color:#38bdf8;font-weight:bold;"
+    );
+
+    // ── log 2: expandable object ──────────────────────────────────
+    console.log("[gridShapePoints] full object →", gridShapePoints);
+
+    // ── log 3: expandable points array only ───────────────────────
+    console.log("[gridShapePoints] points →", data.points);
+
+    // ── log 4: shapeids as expandable array ───────────────────────
+    const shapeids = data.points.map(p => p.id);
+    console.log("[gridShapePoints] shapeids →", shapeids);
+
+  } catch (err) {
+    console.error("[loadGridShapePoints] failed:", err);
+    gridShapePoints = null;
+  }
+}
+
+// Finds up to NEAREST_MAX_COUNT shapepoints that are:
+//   - within NEAREST_MAX_DIST_M metres of the vehicle, AND
+//   - within a bearing cone of ± NEAREST_BEARING_HALF degrees around the vehicle's compass heading.
+// Results are ranked nearest-first. If the vehicle has no compass reading, the bearing
+// constraint can't be evaluated, so no candidates are shown (rather than guessing a direction).
+function findNearestShapepointToVehicle() {
+  nearestLayer.clearLayers();
+
+  if (!gridShapePoints || gridShapePoints.points.length === 0 || vehiclePoints.length === 0) {
+    nearestShapepoint = null;
+    clearVehicleScore("no shapepoints in cell");
+    return;
+  }
+
+  const vp = vehiclePoints[vehicleIndex];
+
+  if (vp.compass === null || vp.compass === undefined) {
+    nearestShapepoint = null;
+    console.log("[nearest] vehicle has no compass heading — skipping directional search");
+    clearVehicleScore("no compass heading");
+    return;
+  }
+
+  const ranked = gridShapePoints.points
+    .map(sp => ({
+      sp,
+      dist:    haversineMeters(vp.lat, vp.lon, sp.lat, sp.lon),
+      bearing: bearingDegrees(vp.lat, vp.lon, sp.lat, sp.lon),
+    }))
+    .sort((a, b) => a.dist - b.dist)
+    .filter(({ dist })    => dist <= NEAREST_MAX_DIST_M)
+    .filter(({ bearing }) => angleDiff(bearing, vp.compass) <= NEAREST_BEARING_HALF);
+
+  if (ranked.length === 0) {
+    nearestShapepoint = null;
+    console.log("[nearest] no shapepoints within 200m / ±45° of compass heading");
+    clearVehicleScore("no shapepoints in range");
+    return;
+  }
+
+  // store the closest one for external use
+  nearestShapepoint = { shapepoint: ranked[0].sp, distanceM: ranked[0].dist };
+
+  // ─────────────────────────────────────────────────────────────────
+  //  CONSOLE OUTPUT 1 — SHAPE_GROUPS
+  //  groups shapepoints by rounded distance+bearing bucket
+  // ─────────────────────────────────────────────────────────────────
+  const DIST_BUCKET  = 10;   // group points within 10m of each other
+  const groups = [];
+
+  ranked.forEach(({ sp, dist, bearing }) => {
+    // find existing group within bucket range
+    const existing = groups.find(g =>
+      Math.abs(g._dist - dist) <= DIST_BUCKET
+    );
+    if (existing) {
+      existing.shape_ids.push(sp.id);
+    } else {
+      groups.push({
+        _dist     : dist,                        // internal for bucketing
+        distance  : parseFloat(dist.toFixed(1)),
+        bearing   : parseFloat(bearing.toFixed(1)),
+        shape_ids : [sp.id],
+      });
+    }
+  });
+
+  // print SHAPE_GROUPS
+  const shapeGroupsStr = groups.map(g => {
+    const idsFormatted = g.shape_ids
+      .map((id, i) => (i % 4 === 0 ? '\n            ' : '') + id)
+      .join(', ');
+    return (
+      `    {\n` +
+      `        'distance': ${g.distance}, 'bearing': ${g.bearing}, 'shape_ids': [` +
+      `${idsFormatted},\n        ]\n    }`
+    );
+  }).join(',\n');
+
+  console.log("Nearest shapeids: ")
+  console.log(
+    `%cSHAPE_GROUPS = [\n${shapeGroupsStr}\n]`,
+    "color:#38bdf8; font-family:monospace;"
+  );
+
+  // ─────────────────────────────────────────────────────────────────
+  //  CONSOLE OUTPUT 2 — flat shapeids list
+  // ─────────────────────────────────────────────────────────────────
+  const allIds     = ranked.map(({ sp }) => sp.id);
+  const idsChunked = [];
+  for (let i = 0; i < allIds.length; i += 4) {
+    idsChunked.push('    ' + allIds.slice(i, i + 4).join(', ') + ',');
+  }
+
+  console.log(
+    `%cshapeids = [\n${idsChunked.join('\n')}\n]`,
+    "color:#4ade80; font-family:monospace;"
+  );
+
+  // ─────────────────────────────────────────────────────────────────
+  //  EXISTING visual rendering — unchanged
+  // ─────────────────────────────────────────────────────────────────
+  const RANKS = [
+    { label: "1st nearest",  radius: 6, color: "#a21caf", fill: "#e879f9", lineW: 2,    lineOp: 0.85 },
+    { label: "2nd nearest",  radius: 6, color: "#7e22ce", fill: "#c084fc", lineW: 1.5,  lineOp: 0.55 },
+    { label: "3rd nearest",  radius: 6, color: "#4c1d95", fill: "#a78bfa", lineW: 1,    lineOp: 0.35 },
+    { label: "4th nearest",  radius: 6, color: "#312e81", fill: "#818cf8", lineW: 0.75, lineOp: 0.25 },
+    { label: "5th nearest",  radius: 6, color: "#1e1b4b", fill: "#6366f1", lineW: 0.5,  lineOp: 0.18 },
+    { label: "6th nearest",  radius: 5, color: "#1e3a5f", fill: "#38bdf8", lineW: 0.45, lineOp: 0.15 },
+    { label: "7th nearest",  radius: 5, color: "#164e63", fill: "#22d3ee", lineW: 0.4,  lineOp: 0.13 },
+    { label: "8th nearest",  radius: 5, color: "#065f46", fill: "#34d399", lineW: 0.35, lineOp: 0.11 },
+    { label: "9th nearest",  radius: 4, color: "#14532d", fill: "#86efac", lineW: 0.3,  lineOp: 0.09 },
+    { label: "10th nearest", radius: 4, color: "#1a2e05", fill: "#bef264", lineW: 0.25, lineOp: 0.07 },
+    { label: "11th nearest", radius: 4, color: "#134e4a", fill: "#2dd4bf", lineW: 0.23, lineOp: 0.07 },
+    { label: "12th nearest", radius: 4, color: "#115e59", fill: "#5eead4", lineW: 0.22, lineOp: 0.06 },
+    { label: "13th nearest", radius: 4, color: "#0f766e", fill: "#99f6e4", lineW: 0.21, lineOp: 0.06 },
+    { label: "14th nearest", radius: 3, color: "#0d9488", fill: "#ccfbf1", lineW: 0.20, lineOp: 0.06 },
+    { label: "15th nearest", radius: 3, color: "#0891b2", fill: "#a5f3fc", lineW: 0.19, lineOp: 0.05 },
+    { label: "16th nearest", radius: 3, color: "#166534", fill: "#86efac", lineW: 0.18, lineOp: 0.05 },
+    { label: "17th nearest", radius: 3, color: "#14532d", fill: "#4ade80", lineW: 0.17, lineOp: 0.05 },
+    { label: "18th nearest", radius: 3, color: "#15803d", fill: "#bbf7d0", lineW: 0.16, lineOp: 0.05 },
+    { label: "19th nearest", radius: 3, color: "#16a34a", fill: "#dcfce7", lineW: 0.15, lineOp: 0.05 },
+    { label: "20th nearest", radius: 3, color: "#365314", fill: "#d9f99d", lineW: 0.14, lineOp: 0.04 },
+    { label: "21st nearest", radius: 3, color: "#3f6212", fill: "#bef264", lineW: 0.13, lineOp: 0.04 },
+    { label: "22nd nearest", radius: 3, color: "#4d7c0f", fill: "#a3e635", lineW: 0.13, lineOp: 0.04 },
+    { label: "23rd nearest", radius: 3, color: "#713f12", fill: "#fde68a", lineW: 0.12, lineOp: 0.04 },
+    { label: "24th nearest", radius: 3, color: "#78350f", fill: "#fcd34d", lineW: 0.12, lineOp: 0.04 },
+    { label: "25th nearest", radius: 3, color: "#92400e", fill: "#fbbf24", lineW: 0.11, lineOp: 0.04 },
+    { label: "26th nearest", radius: 2, color: "#9a3412", fill: "#fdba74", lineW: 0.11, lineOp: 0.04 },
+    { label: "27th nearest", radius: 2, color: "#7c2d12", fill: "#fb923c", lineW: 0.10, lineOp: 0.03 },
+    { label: "28th nearest", radius: 2, color: "#6b2117", fill: "#f97316", lineW: 0.10, lineOp: 0.03 },
+    { label: "29th nearest", radius: 2, color: "#991b1b", fill: "#fca5a5", lineW: 0.09, lineOp: 0.03 },
+    { label: "30th nearest", radius: 2, color: "#7f1d1d", fill: "#f87171", lineW: 0.09, lineOp: 0.03 },
+    { label: "31st nearest", radius: 2, color: "#881337", fill: "#fda4af", lineW: 0.08, lineOp: 0.03 },
+    { label: "32nd nearest", radius: 2, color: "#9f1239", fill: "#fb7185", lineW: 0.08, lineOp: 0.03 },
+    { label: "33rd nearest", radius: 2, color: "#be123c", fill: "#fecdd3", lineW: 0.08, lineOp: 0.03 },
+    { label: "34th nearest", radius: 2, color: "#4c0519", fill: "#fda4af", lineW: 0.07, lineOp: 0.03 },
+    { label: "35th nearest", radius: 2, color: "#500724", fill: "#fbcfe8", lineW: 0.07, lineOp: 0.02 },
+    { label: "36th nearest", radius: 2, color: "#701a75", fill: "#f0abfc", lineW: 0.07, lineOp: 0.02 },
+    { label: "37th nearest", radius: 2, color: "#86198f", fill: "#e879f9", lineW: 0.06, lineOp: 0.02 },
+    { label: "38th nearest", radius: 2, color: "#6b21a8", fill: "#d946ef", lineW: 0.06, lineOp: 0.02 },
+    { label: "39th nearest", radius: 2, color: "#581c87", fill: "#c026d3", lineW: 0.06, lineOp: 0.02 },
+    { label: "40th nearest", radius: 2, color: "#3b0764", fill: "#a855f7", lineW: 0.05, lineOp: 0.02 },
+    { label: "41st nearest", radius: 2, color: "#1e293b", fill: "#94a3b8", lineW: 0.05, lineOp: 0.02 },
+    { label: "42nd nearest", radius: 2, color: "#0f172a", fill: "#cbd5e1", lineW: 0.05, lineOp: 0.02 },
+    { label: "43rd nearest", radius: 2, color: "#1e1e2e", fill: "#e2e8f0", lineW: 0.04, lineOp: 0.02 },
+    { label: "44th nearest", radius: 2, color: "#18181b", fill: "#d4d4d8", lineW: 0.04, lineOp: 0.01 },
+    { label: "45th nearest", radius: 2, color: "#27272a", fill: "#a1a1aa", lineW: 0.04, lineOp: 0.01 },
+    { label: "46th nearest", radius: 1, color: "#3f3f46", fill: "#71717a", lineW: 0.03, lineOp: 0.01 },
+    { label: "47th nearest", radius: 1, color: "#52525b", fill: "#a8a29e", lineW: 0.03, lineOp: 0.01 },
+    { label: "48th nearest", radius: 1, color: "#44403c", fill: "#d6d3d1", lineW: 0.03, lineOp: 0.01 },
+    { label: "49th nearest", radius: 1, color: "#292524", fill: "#e7e5e4", lineW: 0.02, lineOp: 0.01 },
+    { label: "50th nearest", radius: 1, color: "#1c1917", fill: "#f5f5f4", lineW: 0.02, lineOp: 0.01 },
+  ];
+
+  ranked.forEach(({ sp, dist, bearing }, idx) => {
+    const s = RANKS[Math.min(idx, RANKS.length - 1)];
+    L.circleMarker([sp.lat, sp.lon], {
+      radius: s.radius, color: s.color, fillColor: s.fill,
+      fillOpacity: 1.0, weight: 2.5,
+    })
+    .bindTooltip(
+      `<b>${s.label}</b><br>` +
+      `ID: ${sp.id}<br>` +
+      `${sp.lat.toFixed(6)}°, ${sp.lon.toFixed(6)}°<br>` +
+      `Distance: <b>${dist.toFixed(1)} m</b><br>` +
+      `Bearing: <b>${bearing.toFixed(1)}°</b>`,
+      { sticky: true }
+    )
+    .addTo(nearestLayer);
+
+    L.marker([sp.lat, sp.lon], {
+      icon: L.divIcon({
+        className: "",
+        html: `<span style="background:${s.color};color:#fff;font-size:10px;font-weight:700;` +
+              `padding:1px 5px;border-radius:8px;white-space:nowrap;pointer-events:none;"` +
+              `>#${idx + 1}</span>`,
+        iconAnchor: [-10, 6],
+      }),
+      interactive: false,
+    }).addTo(nearestLayer);
+  });
+
+  scoreVehiclePosition(vp, ranked);
+}
+
+// ── vehicle trip/block scoring ────────────────────────────────────────────────
+
+// Sets the "Best match" line in the vehicle nav control. state is one of:
+// "pending" (scoring in flight/not yet run), "none" (ran, no candidates), or
+// omitted (a real result is being shown).
+function setScoreDisplay(result, state) {
+  const el = document.getElementById("nav-score");
+  if (!el) return;
+
+  if (state === "pending") {
+    el.textContent = "Best match: scoring…";
+    el.className   = "nav-score nav-score-pending";
+    return;
+  }
+  if (state === "none" || !result || !result.blocks || result.blocks.length === 0) {
+    el.textContent = "Best match: none";
+    el.className   = "nav-score nav-score-none";
+    return;
+  }
+
+  const top = result.blocks[0];
+  el.textContent = `Best match: Block ${top.blockid} (${(top.block_score * 100).toFixed(0)}%)`;
+  el.className   = "nav-score nav-score-ok";
+}
+
+function clearVehicleScore(reason) {
+  vehicleScoreResult = null;
+  setScoreDisplay(null, "none");
+  console.log(`%c[vehicle-score] cleared — ${reason}`, "color:#94a3b8;");
+}
+
+// Groups the ranked shapepoints (each already has its own distance + bearing from the
+// vehicle) into scoring groups and posts them to /api/vehicle-score. Mirrors the offline
+// scoring script: shapepoint(s) → PSID → routeid/patternid → blockid/tripid, scored on
+// distance, heading (vs vehicle compass) and schedule (vs vehicle's current DATE_TIME).
+async function scoreVehiclePosition(vp, ranked) {
+  if (!ranked || ranked.length === 0 || !vp.datetime) {
+    clearVehicleScore("nothing to score");
+    return;
+  }
+
+  const groups = ranked.map(({ sp, dist, bearing }) => ({
+    distance:  dist,
+    bearing:   bearing,
+    shape_ids: [sp.id],
+  }));
+
+
+  const requestId = ++vehicleScoreRequestId;   // guard against stale/out-of-order responses
+  setScoreDisplay(null, "pending");
+
+  try {
+    const res = await fetch("/api/vehicle-score", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        groups,
+        reference_time: vp.datetime,
+        compass: vp.compass,
+      }),
+    });
+    const data = await res.json();
+
+    if (requestId !== vehicleScoreRequestId) return;  // a newer position was navigated to meanwhile
+
+    if (!res.ok) {
+      console.error("[vehicle-score] request failed:", data.error || res.status);
+      clearVehicleScore("request failed");
+      return;
+    }
+
+    vehicleScoreResult = data;
+    setScoreDisplay(data);
+
+    console.log(
+      `%c[vehicle-score] ${vp.time} · compass ${vp.compass}° · ` +
+      `${data.trips.length} trip candidate(s), ${data.blocks.length} block(s)`,
+      "color:#fbbf24;font-weight:bold;"
+    );
+    if (data.trips.length > 0) {
+      console.log("Trip scores:");
+      console.table(data.trips);
+      console.log("Block scores:");
+      console.table(data.blocks);
+    } else {
+      console.log("[vehicle-score] no candidate trips found near this reference time");
+    }
+  } catch (err) {
+    if (requestId !== vehicleScoreRequestId) return;
+    console.error("[vehicle-score] error:", err);
+    clearVehicleScore("request error");
+  }
+}
+
+// ── load grid ─────────────────────────────────────────────────────────────────
+
+async function loadGrid() {
+  const res  = await fetch("/api/grid");
+  const data = await res.json();
+
+  data.cells.forEach(cell => {
+    cellColorMap[`${cell.row}_${cell.col}`] = cell.color;
+    const rect = L.rectangle(
+      [[cell.south, cell.west], [cell.north, cell.east]],
+      { color: "#1F4E5C", weight: 0.5, fill: true, fillColor: cell.color, fillOpacity: 0.55 }
+    );
+    rect.bindTooltip(`${cell.count} stop${cell.count > 1 ? "s" : ""} — click to select`, { sticky: true });
+    rect.on("click", () => openCellPanel(cell, rect));
+    rect.addTo(gridLayer);
+  });
+}
+
+// ── load stops ────────────────────────────────────────────────────────────────
+
+async function loadStops() {
+  const res  = await fetch("/api/stops");
+  const data = await res.json();
+  allStopData = data.stops;
+
+  allStopData.forEach(s => {
+    L.circleMarker([s.lat, s.lon], { ...STYLE_NORMAL })
+      .bindTooltip(`Stop ${s.id} — select a cell first`)
+      .addTo(stopsCluster);
+  });
+
+  map.addLayer(stopsCluster);
+}
+
+// ── load vehicle GPS route ────────────────────────────────────────────────────
+
+async function loadVehicleRoute() {
+  try {
+    const res  = await fetch("/api/vehicle-route");
+    const data = await res.json();
+
+    if (data.total === 0) {
+      console.warn("[vehicle] no position data returned");
+      document.getElementById("nav-idx").textContent = "no data";
+      return;
+    }
+
+    vehiclePoints = data.points;
+    vehicleId     = data.vehicle;
+
+    const latLngs = data.points.map(p => [p.lat, p.lon]);
+
+    L.polyline(latLngs, { color: "#22c55e", weight: 2.5, opacity: 0.55 })
+      .bindTooltip(`Vehicle ${data.vehicle} · Block ${data.block} · Trip ${data.trip}`, { sticky: true })
+      .addTo(vehicleLayer);
+
+    data.points.forEach((p, idx) => {
+      const isFirst = idx === 0;
+      const isLast  = idx === data.points.length - 1;
+      L.circleMarker([p.lat, p.lon], {
+        radius:      isFirst || isLast ? 6 : 3,
+        color:       isFirst ? "#16a34a" : isLast ? "#dc2626" : "#22c55e",
+        fillColor:   isFirst ? "#4ade80" : isLast ? "#f87171" : "#86efac",
+        fillOpacity: 0.9,
+        weight: 1,
+        interactive: false,
+      }).addTo(vehicleLayer);
+    });
+
+    vehicleIndex = 0;
+    updateCurrentPosition();
+
+    console.log(
+      `%c[vehicle] ${data.total} positions loaded for vehicle ${data.vehicle}`,
+      "color:#22c55e;font-weight:bold;"
+    );
+  } catch (err) {
+    console.error("[vehicle] load failed:", err);
+  }
+}
+
+// ── cluster ↔ individual mode ─────────────────────────────────────────────────
+
+function switchToIndividual(cell) {
+  if (map.hasLayer(stopsCluster)) map.removeLayer(stopsCluster);
+  individualLayer.clearLayers();
+  stopMarkerMap = {};
+
+  allStopData.forEach(s => {
+    const inCell = isInCell(s, cell);
+    if (!inCell) {
+      L.circleMarker([s.lat, s.lon], { ...STYLE_DIMMED, interactive: false }).addTo(individualLayer);
+      return;
+    }
+    const m = L.circleMarker([s.lat, s.lon], { ...STYLE_IN_CELL }).bindTooltip(`Stop ${s.id}`);
+    m.on("click", e => { L.DomEvent.stopPropagation(e); handleStopClick(s); });
+    stopMarkerMap[s.id] = m;
+    m.addTo(individualLayer);
+  });
+
+  if (!map.hasLayer(individualLayer)) map.addLayer(individualLayer);
+}
+
+function switchToCluster() {
+  if (map.hasLayer(individualLayer)) map.removeLayer(individualLayer);
+  individualLayer.clearLayers();
+  stopMarkerMap = {};
+  if (!map.hasLayer(stopsCluster)) map.addLayer(stopsCluster);
+}
+
+// ── CELL panel ────────────────────────────────────────────────────────────────
+
+async function openCellPanel(cell, rect) {
+  clearAllSelectedStops();
+
+  if (selectedCell?.rect) {
+    const c = cellColorMap[`${selectedCell.row}_${selectedCell.col}`] || selectedCell.color;
+    selectedCell.rect.setStyle(CELL_STYLE_NORMAL(c));
+  }
+
+  rect.setStyle(CELL_STYLE_SELECTED(cell.color));
+  selectedCell = { ...cell, rect };
+
+  switchToIndividual(cell);
+
+  // Store shape points for the vehicle's current cell (NOT the clicked cell),
+  // then find the nearest shape point to the vehicle's current position.
+  updateVehicleGridAndNearest();
+
+  setPanelTitle(`Cell (${cell.row}, ${cell.col})`, null);
+  openPanel();
+  await fetchCellPanel(cell);
+}
+
+async function fetchCellPanel(cell) {
+  setPanelLoading("Fetching stops…");
+  try {
+    const res  = await fetch(`/api/cell-stops?row=${cell.row}&col=${cell.col}`);
+    const data = await res.json();
+    renderCellPanel(data.cell, data.stops);
+  } catch (err) { showError(err.message); }
+}
+
+function renderCellPanel(cell, stops) {
+  const rows = stops.map(s => `
+    <tr><td>${s.id}</td><td>${s.lat.toFixed(6)}</td><td>${s.lon.toFixed(6)}</td></tr>`
+  ).join("");
+
+  document.getElementById("panel-body").innerHTML = `
+    <div class="meta-grid">
+      <div class="meta-card accent full">
+        <div class="label">Stop count</div>
+        <div class="value" style="font-size:22px;color:#38bdf8;">${cell.count}</div>
+      </div>
+      <div class="meta-card">
+        <div class="label">Cell index</div>
+        <div class="value">(${cell.row}, ${cell.col})</div>
+      </div>
+      <div class="meta-card">
+        <div class="label">Centre</div>
+        <div class="value" style="font-size:11px;">${cell.center_lat}°<br>${cell.center_lon}°</div>
+      </div>
+    </div>
+    <div class="section-label">Bounds</div>
+    <table class="bounds-table">
+      <tr><td>South</td><td>${cell.south.toFixed(6)}°</td></tr>
+      <tr><td>North</td><td>${cell.north.toFixed(6)}°</td></tr>
+      <tr><td>West</td> <td>${cell.west.toFixed(6)}°</td></tr>
+      <tr><td>East</td> <td>${cell.east.toFixed(6)}°</td></tr>
+    </table>
+    <div class="hint-box">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/>
+      </svg>
+      Click highlighted stops — select multiple to compare routes
+    </div>
+    <div class="section-label">Stops in cell (${stops.length})</div>
+    <div class="table-wrap">
+      ${stops.length === 0
+        ? `<div class="state-box">No stops found</div>`
+        : `<table class="data-table">
+             <thead><tr><td>ID</td><td>Latitude</td><td>Longitude</td></tr></thead>
+             <tbody>${rows}</tbody>
+           </table>`}
+    </div>`;
+}
+
+// ── STOP multi-select ─────────────────────────────────────────────────────────
+
+function handleStopClick(stop) {
+  if (selectedStops.has(stop.id)) {
+    if (activePanelStopId === stop.id) {
+      deselectStop(stop.id);
+      const remaining = [...selectedStops.keys()];
+      if (remaining.length > 0) {
+        const nextId = remaining[remaining.length - 1];
+        setActiveStop(nextId);
+        openStopPanel(selectedStops.get(nextId).stop);
+      } else {
+        activePanelStopId = null;
+        setPanelTitle(`Cell (${selectedCell.row}, ${selectedCell.col})`, null);
+        fetchCellPanel(selectedCell);
+      }
+    } else {
+      setActiveStop(stop.id);
+      openStopPanel(stop);
+    }
+  } else {
+    const m = stopMarkerMap[stop.id];
+    if (activePanelStopId && selectedStops.has(activePanelStopId)) {
+      selectedStops.get(activePanelStopId).marker?.setStyle(STYLE_SELECTED_INACTIVE);
+    }
+    if (m) { m.setStyle(STYLE_SELECTED_ACTIVE); m.bringToFront(); }
+    selectedStops.set(stop.id, { stop, marker: m, routes: new Map() });
+    activePanelStopId = stop.id;
+    openStopPanel(stop);
+  }
+}
+
+function setActiveStop(id) {
+  if (activePanelStopId && selectedStops.has(activePanelStopId)) {
+    selectedStops.get(activePanelStopId).marker?.setStyle(STYLE_SELECTED_INACTIVE);
+  }
+  activePanelStopId = id;
+  selectedStops.get(id)?.marker?.setStyle(STYLE_SELECTED_ACTIVE);
+  selectedStops.get(id)?.marker?.bringToFront();
+}
+
+function deselectStop(id) {
+  const entry = selectedStops.get(id);
+  if (!entry) return;
+  entry.routes.forEach(r => map.removeLayer(r.layer));
+  entry.marker?.setStyle(STYLE_IN_CELL);
+  selectedStops.delete(id);
+  if (activePanelStopId === id) activePanelStopId = null;
+}
+
+function clearAllSelectedStops() {
+  selectedStops.forEach((entry, id) => deselectStop(id));
+  selectedStops.clear();
+  activePanelStopId = null;
+}
+
+// ── STOP panel ────────────────────────────────────────────────────────────────
+
+async function openStopPanel(stop) {
+  const bc = selectedCell ? `Cell (${selectedCell.row}, ${selectedCell.col})` : null;
+  setPanelTitle(`Stop ${stop.id}`, bc);
+  setPanelLoading("Fetching routes…");
+  openPanel();
+
+  try {
+    const res  = await fetch(`/api/stop-routes?stop_id=${stop.id}`);
+    const data = await res.json();
+    renderStopPanel(stop, data);
+  } catch (err) { showError(err.message); }
+}
+
+function renderStopPanel(stop, data) {
+  const routes = selectedStops.get(stop.id)?.routes || new Map();
+
+  const routeRows = data.routes.map(r => {
+    const key        = `${r.ROUTEID}_${r.PATTERNID}`;
+    const isSelected = routes.has(key);
+    const color      = isSelected ? routes.get(key).color : "";
+    return `
+    <tr class="route-row ${isSelected ? "route-selected" : ""}"
+        onclick="toggleRoute(${r.ROUTEID}, ${r.PATTERNID}, this)">
+      <td><span class="route-dot" style="${color ? `background:${color};border-color:${color};` : ""}"></span></td>
+      <td>${r.ROUTEID}</td>
+      <td>${r.PATTERNID}</td>
+    </tr>`;
+  }).join("");
+
+  const badge = selectedStops.size > 1
+    ? `<span class="stop-badge">${selectedStops.size} stops selected</span>` : "";
+
+  document.getElementById("panel-body").innerHTML = `
+    <div class="meta-grid">
+      <div class="meta-card accent full">
+        <div class="label">Stop ID ${badge}</div>
+        <div class="value" style="font-size:22px;color:#fb923c;">${data.stop_id}</div>
+      </div>
+      <div class="meta-card">
+        <div class="label">Latitude</div>
+        <div class="value">${stop.lat.toFixed(6)}°</div>
+      </div>
+      <div class="meta-card">
+        <div class="label">Longitude</div>
+        <div class="value">${stop.lon.toFixed(6)}°</div>
+      </div>
+      <div class="meta-card full">
+        <div class="label">Routes serving this stop</div>
+        <div class="value">${data.total}</div>
+      </div>
+    </div>
+    <div class="hint-box">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <polyline points="9 11 12 14 22 4"/>
+        <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/>
+      </svg>
+      Toggle routes below — click another stop to compare
+    </div>
+    <div class="section-label">Routes &amp; Patterns</div>
+    <div class="table-wrap">
+      ${data.routes.length === 0
+        ? `<div class="state-box">No routes found for this stop</div>`
+        : `<table class="data-table">
+             <thead><tr><td></td><td>Route ID</td><td>Pattern ID</td></tr></thead>
+             <tbody>${routeRows}</tbody>
+           </table>`}
+    </div>
+    <div id="geometry-section"></div>`;
+
+  updateGeometrySection();
+}
+
+// ── ROUTE toggle ──────────────────────────────────────────────────────────────
+
+async function toggleRoute(routeId, patternId, rowEl) {
+  if (!activePanelStopId) return;
+  const stopEntry = selectedStops.get(activePanelStopId);
+  if (!stopEntry) return;
+
+  const routes = stopEntry.routes;
+  const key    = `${routeId}_${patternId}`;
+
+  if (routes.has(key)) {
+    map.removeLayer(routes.get(key).layer);
+    routes.delete(key);
+    rowEl.classList.remove("route-selected");
+    const dot = rowEl.querySelector(".route-dot");
+    if (dot) { dot.style.background = ""; dot.style.borderColor = ""; }
+    updateGeometrySection();
+    return;
+  }
+
+  const color = nextRouteColor(routes);
+  rowEl.classList.add("route-loading");
+
+  try {
+    const res  = await fetch(`/api/route-geometry?routeid=${routeId}&patternid=${patternId}`);
+    const data = await res.json();
+    const layer = L.layerGroup().addTo(map);
+    drawRouteOnLayer(data, layer);
+    routes.set(key, { routeId, patternId, color, layer, data });
+
+    rowEl.classList.remove("route-loading");
+    rowEl.classList.add("route-selected");
+    const dot = rowEl.querySelector(".route-dot");
+    if (dot) { dot.style.background = color; dot.style.borderColor = color; }
+    updateGeometrySection();
+  } catch (err) {
+    rowEl.classList.remove("route-loading");
+    console.error("route-geometry error:", err);
+  }
+}
+
+function drawRouteOnLayer(data, layer) {
+  data.psids.forEach((psidData, idx) => {
+    const color   = ROUTE_COLORS[idx % ROUTE_COLORS.length];
+    const latLngs = psidData.points.map(p => [p.lat, p.lon]);
+    if (latLngs.length < 1) return;
+    if (latLngs.length >= 2) {
+      L.polyline(latLngs, { color, weight: 3.5, opacity: 0.9 })
+        .bindTooltip(`Route ${data.route_id} · Pattern ${data.pattern_id} · PSID ${psidData.psid}`, { sticky: true })
+        .addTo(layer);
+    }
+    psidData.points.forEach(p => {
+      L.circleMarker([p.lat, p.lon], {
+        radius: 3.5, color, fillColor: color, fillOpacity: 0.95, weight: 1,
+      }).addTo(layer);
+    });
+  });
+}
+
+function updateGeometrySection() {
+  const section = document.getElementById("geometry-section");
+  if (!section) return;
+  const routes = activeStopRoutes();
+  if (routes.size === 0) { section.innerHTML = ""; return; }
+
+  let blocks = "";
+  routes.forEach(e => {
+    const psidRows = e.data.psids.map((p, idx) => {
+      const color = ROUTE_COLORS[idx % ROUTE_COLORS.length];
+      return `<tr>
+        <td><span class="psid-swatch" style="background:${color};"></span></td>
+        <td>${p.psid}</td>
+        <td>${p.points.length} pts</td>
+      </tr>`;
+    }).join("");
+    blocks += `
+    <div class="route-legend-block">
+      <div class="route-legend-header">
+        <span class="psid-swatch" style="background:${e.color};width:14px;height:14px;"></span>
+        <span style="font-weight:600;">Route ${e.routeId} · Pattern ${e.patternId}</span>
+        <span style="color:#64748b;font-size:11px;margin-left:auto;">${e.data.total_psids} PSIDs</span>
+      </div>
+      <div class="table-wrap" style="margin-top:6px;">
+        <table class="data-table">
+          <thead><tr><td></td><td>PSID</td><td>Points</td></tr></thead>
+          <tbody>${psidRows}</tbody>
+        </table>
+      </div>
+    </div>`;
+  });
+
+  section.innerHTML = `
+    <div class="section-label" style="margin-top:16px;">
+      Active geometry (${routes.size} route${routes.size > 1 ? "s" : ""})
+    </div>${blocks}`;
+}
+
+// ── panel helpers ─────────────────────────────────────────────────────────────
+
+function setPanelTitle(title, breadcrumb) {
+  document.getElementById("panel-title").textContent = title;
+  const bc = document.getElementById("panel-breadcrumb");
+  bc.textContent   = breadcrumb ? `← ${breadcrumb}` : "";
+  bc.style.display = breadcrumb ? "inline" : "none";
+}
+function setPanelLoading(msg) {
+  document.getElementById("panel-body").innerHTML =
+    `<div class="state-box"><div class="spinner"></div>${msg}</div>`;
+}
+function openPanel() {
+  document.getElementById("panel").classList.add("open");
+  document.getElementById("map").classList.add("panel-open");
+  setTimeout(() => map.invalidateSize(), 310);
+}
+function closePanel() {
+  document.getElementById("panel").classList.remove("open");
+  document.getElementById("map").classList.remove("panel-open");
+  if (selectedCell?.rect) {
+    const c = cellColorMap[`${selectedCell.row}_${selectedCell.col}`] || selectedCell.color;
+    selectedCell.rect.setStyle(CELL_STYLE_NORMAL(c));
+  }
+  selectedCell    = null;
+  gridShapePoints = null;
+  clearAllSelectedStops();
+  switchToCluster();
+  setTimeout(() => map.invalidateSize(), 310);
+}
+function backToCell() {
+  if (!selectedCell) return;
+  clearAllSelectedStops();
+  setPanelTitle(`Cell (${selectedCell.row}, ${selectedCell.col})`, null);
+  fetchCellPanel(selectedCell);
+}
+function showError(msg) {
+  document.getElementById("panel-body").innerHTML =
+    `<div class="state-box" style="color:#e63946;">Something went wrong.<br><small>${msg}</small></div>`;
+}
+
+// ── toggles ───────────────────────────────────────────────────────────────────
+
+function toggleVehicle() {
+  const btn = document.getElementById("toggle-vehicle");
+  const nav = document.querySelector(".vehicle-nav-control");
+
+  if (vehicleVisible) {
+    map.removeLayer(vehicleLayer);
+    map.removeLayer(nearestLayer);
+    map.removeLayer(torchLayer);
+    map.removeLayer(nearbyStopsLayer);
+    map.removeLayer(currentPosLayer);
+    if (nav) nav.style.display = "none";
+    btn.textContent = "Show vehicle";
+    vehicleVisible  = false;
+  } else {
+    map.addLayer(vehicleLayer);
+    map.addLayer(nearestLayer);
+    map.addLayer(torchLayer);
+    map.addLayer(nearbyStopsLayer);
+    map.addLayer(currentPosLayer);
+    if (nav) nav.style.display = "";
+    btn.textContent = "Hide vehicle";
+    vehicleVisible  = true;
+  }
+}
+
+function toggleStops() {
+  const btn = document.getElementById("toggle-stops");
+  if (stopsVisible) {
+    if (map.hasLayer(stopsCluster))    map.removeLayer(stopsCluster);
+    if (map.hasLayer(individualLayer)) map.removeLayer(individualLayer);
+    btn.textContent = "Show stops";
+    stopsVisible = false;
+  } else {
+    if (selectedCell) { if (!map.hasLayer(individualLayer)) map.addLayer(individualLayer); }
+    else              { if (!map.hasLayer(stopsCluster))    map.addLayer(stopsCluster); }
+    btn.textContent = "Hide stops";
+    stopsVisible = true;
+  }
+}
+
+// ── boot ──────────────────────────────────────────────────────────────────────
+
+(async function boot() {
+  await Promise.all([loadGrid(), loadStops(), loadVehicleRoute()]);
+  updateCurrentPosition();   // redraw now that stops are loaded, so nearby-stops highlight is correct
+  updateVehicleGridAndNearest();  // run the initial nearest-shapepoint + trip/block score
+  document.getElementById("loading-overlay").classList.add("hidden");
+})();
+
+</script>
+</body>
+</html>
