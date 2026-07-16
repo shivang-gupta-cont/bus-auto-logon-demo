@@ -14,27 +14,27 @@ BASE_VERSION = "20260503"
 KM_LAT       = 1 / 111.0
 DSDB_CONFIG  = {"user": "dsdb", "password": "elcaro", "dsn": "localhost:1521/pdb1"}
 
-# ── vehicle trip-scoring constants (mirrors the offline scoring script) ──────
+# ── vehicle trip-scoring constants ───────────────────────────────────────────
 
-SCORE_MAX_DISTANCE_M   = 200.0   # distance score hits 0 at this distance
-SCORE_MAX_HEADING_DIFF = 45.0    # heading score hits 0 at this angular diff
-SCORE_SCHEDULE_TAU_SEC = 300.0   # schedule score decay constant (5 min)
+SCORE_MAX_DISTANCE_M   = 200.0
+SCORE_MAX_HEADING_DIFF = 45.0
+SCORE_SCHEDULE_TAU_SEC = 300.0
 
-SCORE_MULTI_TRIP_BONUS_PER_EXTRA = 0.03   # bonus per additional trip sharing a block
-SCORE_MULTI_TRIP_BONUS_CAP       = 0.15   # cap on total bonus
+SCORE_MULTI_TRIP_BONUS_PER_EXTRA = 0.03
+SCORE_MULTI_TRIP_BONUS_CAP       = 0.15
 
-# final_score weights — must sum to 1.0
 SCORE_WEIGHT_DISTANCE = 0.40
 SCORE_WEIGHT_HEADING  = 0.35
 SCORE_WEIGHT_SCHEDULE = 0.25
 
-# ── Riyadh bounding box (approximate full-city extents) ──────────────────────
+# ── Riyadh bounding box ──────────────────────────────────────────────────────
+
 RIYADH_MIN_LAT = 24.45
 RIYADH_MAX_LAT = 24.95
 RIYADH_MIN_LON = 46.45
 RIYADH_MAX_LON = 46.95
 
-# ── vehicle position constants ────────────────────────────────────────────────
+# ── vehicle position constants ───────────────────────────────────────────────
 
 TECHVHNO        = 2071
 BLOCKID         = 1992
@@ -42,9 +42,9 @@ TRIPID          = 43581
 TARGET_DATETIME = "16-MAY-2026 05.11.50"
 CSV_PATH        = r"C:\Users\ShivangGupta\Downloads\vehicleposition\vehicleposition\16may.csv"
 
-# ── server-side cell shapepoints data structure ───────────────────────────────
+# ── server-side cell shapepoints data structure ──────────────────────────────
 
-_cell_shapepoints = {"cell": None, "total": 0, "points": []}
+_cell_shapepoints = {"cell": None, "total": 0, "groups": []}
 
 print("Loading vehicle positions from CSV...")
 
@@ -73,7 +73,6 @@ try:
 
     print(f"Vehicle positions loaded: {len(_veh_df)} points "
           f"(vehicle={TECHVHNO}, block={BLOCKID}, trip={TRIPID})")
-
     print(_veh_df)
 
 except Exception as e:
@@ -144,6 +143,9 @@ print(
     f"covering full Riyadh bounding box"
 )
 
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+
 def count_to_color(count):
     light = (204, 233, 240)
     dark  = ( 31,  78,  92)
@@ -153,6 +155,7 @@ def count_to_color(count):
     b = int(light[2] + t * (dark[2] - light[2]))
     return f"#{r:02x}{g:02x}{b:02x}"
 
+
 def cell_bounds(row, col):
     south = row * KM_LAT
     north = south + KM_LAT
@@ -161,12 +164,7 @@ def cell_bounds(row, col):
     return south, north, west, east
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# Vehicle trip scoring — ported from the offline scoring script so it can be
-# run live, per vehicle GPS position, against whatever nearby shapepoints the
-# client found. Chain: shapepoint(s) → PSID → routeid/patternid → blockid/
-# tripid/sched_trip_start_time, then distance/heading/schedule scoring.
-# ══════════════════════════════════════════════════════════════════════════
+# ── vehicle trip scoring ─────────────────────────────────────────────────────
 
 def _score_chunked(lst, size):
     for i in range(0, len(lst), size):
@@ -179,7 +177,7 @@ def _score_distance(distance_m):
 
 def _score_heading(bearing_deg, compass_deg):
     diff = abs(bearing_deg - compass_deg)
-    diff = min(diff, 360 - diff)  # wrap-around safe
+    diff = min(diff, 360 - diff)
     return float(np.clip(1.0 - diff / SCORE_MAX_HEADING_DIFF, 0.0, 1.0))
 
 
@@ -253,6 +251,8 @@ def _score_get_trips(dsdb, combos, serviceday, reference_time_str):
     return pd.concat(frames, ignore_index=True)
 
 
+# ── routes ───────────────────────────────────────────────────────────────────
+
 @app.route("/")
 def index():
     return render_template(
@@ -286,9 +286,9 @@ def api_vehicle_route():
             "lon":      float(r["LONGITUDE"]),
             "compass":  int(r["COMPASSDIRECT"]) if pd.notna(r["COMPASSDIRECT"]) else None,
             "routeid":  int(r["ROUTEID"])       if pd.notna(r["ROUTEID"])       else None,
-            "blockid": int(r["BLOCKID"]) if pd.notna(r["BLOCKID"]) else None,
-            "tripid": int(r["TRIPID"]) if pd.notna(r["TRIPID"]) else None,
-            "techvhno": int(r["TECHVHNO"]) if pd.notna(r["TECHVHNO"]) else None,
+            "blockid":  int(r["BLOCKID"])       if pd.notna(r["BLOCKID"])       else None,
+            "tripid":   int(r["TRIPID"])        if pd.notna(r["TRIPID"])        else None,
+            "techvhno": int(r["TECHVHNO"])      if pd.notna(r["TECHVHNO"])      else None,
         }
         for _, r in _veh_df.iterrows()
     ]
@@ -471,10 +471,10 @@ def api_route_geometry():
     ]
 
     return jsonify({
-        "route_id":    route_id,
-        "pattern_id":  pattern_id,
-        "psids":       psids,
-        "total_psids": len(psids),
+        "route_id":     route_id,
+        "pattern_id":   pattern_id,
+        "psids":        psids,
+        "total_psids":  len(psids),
         "total_points": len(df),
     })
 
@@ -494,7 +494,7 @@ def api_grid_shapepoints():
     north_sc = math.ceil(n  * 3_600_000)
     west_sc  = math.floor(w * 3_600_000)
     east_sc  = math.ceil(e  * 3_600_000)
-    print(south_sc, north_sc, west_sc, east_sc)
+    print(f"[grid-shapepoints] scaled bounds → south={south_sc} north={north_sc} west={west_sc} east={east_sc}")
 
     dsdb = OracleDB(**DSDB_CONFIG)
     dsdb.connect()
@@ -503,7 +503,6 @@ def api_grid_shapepoints():
         """
         SELECT shapepointid, latitude, longitude
         FROM (
-            -- FROM side
             SELECT fromshapeid  AS shapepointid,
                    fromlatitude  AS latitude,
                    fromlongitude AS longitude
@@ -511,10 +510,9 @@ def api_grid_shapepoints():
             WHERE fromlatitude  BETWEEN :south AND :north
               AND fromlongitude BETWEEN :west  AND :east
               AND baseversion   = :baseversion
-        
+
             UNION
-        
-            -- TO side
+
             SELECT toshapeid    AS shapepointid,
                    tolatitude    AS latitude,
                    tolongitude   AS longitude
@@ -525,66 +523,88 @@ def api_grid_shapepoints():
         )
         """,
         {
-            "south": south_sc,
-            "north": north_sc,
-            "west": west_sc,
-            "east": east_sc,
+            "south":       south_sc,
+            "north":       north_sc,
+            "west":        west_sc,
+            "east":        east_sc,
             "baseversion": BASE_VERSION,
         },
     )
 
     dsdb.disconnect()
 
-    points = [
-        {
-            "id":  int(r["SHAPEPOINTID"]),
-            "lat": float(r["LATITUDE"])  / 3_600_000,
-            "lon": float(r["LONGITUDE"]) / 3_600_000,
-        }
-        for _, r in df.iterrows()
-    ]
+    # ── group by (latitude, longitude) ──────────────────────────────────────
+    # shapepoints sharing the exact same raw lat/lon are at the same physical
+    # location → same distance + bearing from the vehicle → one group.
+    # shapegroupid is sequential per request: 1, 2, 3, ...
+    # distance_score + heading_score are shared for all shape_ids in a group;
+    # schedule_score is computed per-trip on the backend (independent of group).
+
+    location_map         = {}   # (raw_lat, raw_lon) → group dict
+    shapegroupid_counter = 1
+
+    for _, row_data in df.iterrows():
+        shape_id = int(row_data["SHAPEPOINTID"])
+        lat_raw  = row_data["LATITUDE"]
+        lon_raw  = row_data["LONGITUDE"]
+
+        key = (lat_raw, lon_raw)   # raw scaled integers — exact match grouping
+
+        if key not in location_map:
+            location_map[key] = {
+                "shapegroupid": shapegroupid_counter,
+                "lat":          float(lat_raw) / 3_600_000,
+                "lon":          float(lon_raw) / 3_600_000,
+                "shape_ids":    [],
+            }
+            shapegroupid_counter += 1
+
+        location_map[key]["shape_ids"].append(shape_id)
+
+    groups = list(location_map.values())
 
     _cell_shapepoints = {
         "cell": {
-            "row":   row,   "col":   col,
+            "row":   row,  "col":   col,
             "south": round(s, 6), "north": round(n, 6),
             "west":  round(w, 6), "east":  round(e, 6),
         },
-        "total":  len(points),
-        "points": points,
+        "total":  len(groups),
+        "groups": groups,
     }
 
-    print(f"[grid-shapepoints] cell ({row},{col}) → {len(points)} shape points stored")
+    print(
+        f"[grid-shapepoints] cell ({row},{col}) → "
+        f"{len(df)} raw shapepoints → "
+        f"{len(groups)} location groups stored"
+    )
     return jsonify(_cell_shapepoints)
 
 
 @app.route("/api/vehicle-score", methods=["POST"])
 def api_vehicle_score():
     """
-    Scores candidate trips/blocks for the vehicle's *current* GPS position.
+    Scores candidate trips/blocks for the vehicle's current GPS position.
 
     Expects JSON body:
       {
-        "groups": [ { "distance": 13.2, "bearing": 234.1, "shape_ids": [..] }, ... ],
-        "reference_time": "16-MAY-2026 05:35:36",   # vehicle's DATE_TIME, DD-MON-YYYY HH24:MI:SS
-        "compass": 225                                # vehicle's current compass heading
+        "groups": [
+          { "distance": 13.2, "bearing": 234.1, "shape_ids": [53588, 54129, 157223] },
+          ...
+        ],
+        "reference_time": "16-MAY-2026 05:35:36",
+        "compass": 225
       }
 
-    "groups" are the nearest shapepoints found client-side (each with its own
-    straight-line distance and bearing from the vehicle) — one group per
-    distinct (distance, bearing) is fine, or one group per shapepoint.
-
-    For each group: shapepoint(s) → PSID → routeid/patternid → candidate trips
-    (blockid/tripid/sched_trip_start_time) near the reference time on the
-    configured SERVICE_DAY/BASE_VERSION. Each trip gets distance_score (from
-    the group's distance), heading_score (group bearing vs vehicle compass),
-    and schedule_score (sched_trip_start_time vs reference_time), combined
-    into final_score. Trips are then rolled up into block_score per blockid.
+    Each group corresponds to one location group (same lat/lon) from the
+    grid-shapepoints response. All shape_ids within a group share the same
+    distance_score and heading_score (computed once per group). schedule_score
+    is computed independently per tripid regardless of group.
     """
-    payload = request.get_json(silent=True) or {}
-    groups              = payload.get("groups", [])
-    reference_time_str  = payload.get("reference_time")
-    compass             = payload.get("compass")
+    payload            = request.get_json(silent=True) or {}
+    groups             = payload.get("groups", [])
+    reference_time_str = payload.get("reference_time")
+    compass            = payload.get("compass")
 
     if not groups or reference_time_str is None or compass is None:
         return jsonify({"error": "groups, reference_time and compass are required"}), 400
@@ -603,10 +623,15 @@ def api_vehicle_score():
     try:
         for gi, group in enumerate(groups, 1):
             distance  = float(group.get("distance", 0))
-            bearing   = float(group.get("bearing", 0))
+            bearing   = float(group.get("bearing",  0))
             shape_ids = group.get("shape_ids", [])
             if not shape_ids:
                 continue
+
+            # distance_score + heading_score — computed ONCE per group
+            # (all shape_ids in the group are at the same lat/lon)
+            dist_score    = _score_distance(distance)
+            heading_score = _score_heading(bearing, compass)
 
             psids = _score_get_psids(dsdb, shape_ids)
             if not psids:
@@ -623,9 +648,10 @@ def api_vehicle_score():
             trips_df["group_index"]    = gi
             trips_df["group_distance"] = distance
             trips_df["group_bearing"]  = bearing
-            trips_df["distance_score"] = _score_distance(distance)
-            trips_df["heading_score"]  = _score_heading(bearing, compass)
+            trips_df["distance_score"] = dist_score      # shared for all trips in this group
+            trips_df["heading_score"]  = heading_score   # shared for all trips in this group
             all_trip_rows.append(trips_df)
+
     finally:
         dsdb.disconnect()
 
@@ -637,7 +663,8 @@ def api_vehicle_score():
 
     final = pd.concat(all_trip_rows, ignore_index=True)
 
-    # schedule score is per-trip (depends on sched_trip_start_time)
+    # schedule_score — computed independently per tripid (per sched_trip_start_time)
+    # regardless of which group the shape_ids came from
     final["sched_trip_start_time"] = pd.to_datetime(final["sched_trip_start_time"])
     final["schedule_score"] = final["sched_trip_start_time"].apply(
         lambda dt: _score_schedule(dt, reference_dt)
@@ -645,12 +672,12 @@ def api_vehicle_score():
 
     final["final_score"] = (
         SCORE_WEIGHT_DISTANCE * final["distance_score"]
-        + SCORE_WEIGHT_HEADING * final["heading_score"]
+        + SCORE_WEIGHT_HEADING  * final["heading_score"]
         + SCORE_WEIGHT_SCHEDULE * final["schedule_score"]
     )
     final = final.sort_values(by="final_score", ascending=False, ignore_index=True)
 
-    # ── block-level aggregation ──────────────────────────────────────────
+    # ── block-level aggregation ──────────────────────────────────────────────
     block_scores = final.groupby("blockid").agg(
         max_trip_score=("final_score", "max"),
         trip_count=("tripid", "nunique"),
@@ -673,11 +700,11 @@ def api_vehicle_score():
             "patternid": int(r.patternid),
             "sched_trip_start_time": r.sched_trip_start_time.strftime("%d-%b-%Y %H:%M:%S"),
             "group_distance":  round(float(r.group_distance), 1),
-            "group_bearing":   round(float(r.group_bearing), 1),
+            "group_bearing":   round(float(r.group_bearing),  1),
             "distance_score":  round(float(r.distance_score), 4),
-            "heading_score":   round(float(r.heading_score), 4),
+            "heading_score":   round(float(r.heading_score),  4),
             "schedule_score":  round(float(r.schedule_score), 4),
-            "final_score":     round(float(r.final_score), 4),
+            "final_score":     round(float(r.final_score),    4),
         }
         for r in final.itertuples(index=False)
     ]
@@ -687,8 +714,8 @@ def api_vehicle_score():
             "blockid":        int(r.blockid),
             "max_trip_score": round(float(r.max_trip_score), 4),
             "trip_count":     int(r.trip_count),
-            "bonus":          round(float(r.bonus), 4),
-            "block_score":    round(float(r.block_score), 4),
+            "bonus":          round(float(r.bonus),          4),
+            "block_score":    round(float(r.block_score),    4),
         }
         for r in block_scores.itertuples(index=False)
     ]
@@ -701,9 +728,9 @@ def api_vehicle_score():
 
     return jsonify({
         "reference_time": reference_time_str,
-        "compass":         compass,
-        "trips":           trips_out,
-        "blocks":          blocks_out,
+        "compass":        compass,
+        "trips":          trips_out,
+        "blocks":         blocks_out,
     })
 
 

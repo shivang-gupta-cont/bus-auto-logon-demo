@@ -73,11 +73,11 @@
 const KM_LAT = 1 / 111.0;
 const KM_LON = 1 / (111.0 * Math.cos({{ center_lat }} * Math.PI / 180));
 
-const STYLE_NORMAL           = { radius: 5, color: "#1F4E5C", fillColor: "#38bdf8", fillOpacity: 0.85, weight: 1 };
-const STYLE_DIMMED           = { radius: 3, color: "#1e293b", fillColor: "#334155", fillOpacity: 0.3,  weight: 0.5 };
-const STYLE_IN_CELL          = { radius: 7, color: "#0e7490", fillColor: "#7dd3fc", fillOpacity: 1.0,  weight: 2 };
-const STYLE_SELECTED_ACTIVE  = { radius: 9, color: "#c2410c", fillColor: "#fb923c", fillOpacity: 1.0,  weight: 2.5 };
-const STYLE_SELECTED_INACTIVE= { radius: 8, color: "#92400e", fillColor: "#d97706", fillOpacity: 0.85, weight: 2 };
+const STYLE_NORMAL            = { radius: 5, color: "#1F4E5C", fillColor: "#38bdf8", fillOpacity: 0.85, weight: 1 };
+const STYLE_DIMMED            = { radius: 3, color: "#1e293b", fillColor: "#334155", fillOpacity: 0.3,  weight: 0.5 };
+const STYLE_IN_CELL           = { radius: 7, color: "#0e7490", fillColor: "#7dd3fc", fillOpacity: 1.0,  weight: 2 };
+const STYLE_SELECTED_ACTIVE   = { radius: 9, color: "#c2410c", fillColor: "#fb923c", fillOpacity: 1.0,  weight: 2.5 };
+const STYLE_SELECTED_INACTIVE = { radius: 8, color: "#92400e", fillColor: "#d97706", fillOpacity: 0.85, weight: 2 };
 
 const CELL_STYLE_NORMAL   = c => ({ weight: 0.5, color: "#1F4E5C", fillColor: c, fillOpacity: 0.55 });
 const CELL_STYLE_SELECTED = c => ({ weight: 3.5, color: "#0f172a", fillColor: c, fillOpacity: 0.7 });
@@ -88,27 +88,20 @@ const ROUTE_COLORS = [
   "#06d6a0","#ff9f1c","#b5179e","#4361ee",
 ];
 
-// Torch beam — how the directional cone is drawn (independent of shapepoint/stoppoint logic).
-// Multiple stacked fan layers, decreasing radius + increasing opacity, give a fade-out look.
 const TORCH_SPREAD_DEG = 45;
 const TORCH_COLOR      = "#ffe139";
-const TORCH_LAYERS = [
-  { radius: 200, opacity: 0.26 },
-];
+const TORCH_LAYERS     = [{ radius: 200, opacity: 0.26 }];
 
-// Nearest-shapepoint search constraints (independent constants, tweak freely).
-const NEAREST_MAX_COUNT    = 50;   // never return more than this many shapepoints
-const NEAREST_MAX_DIST_M   = 200;  // ignore shapepoints farther than this
-const NEAREST_BEARING_HALF = 45;   // shapepoint bearing must fall within compass ± this value
+// nearest-shapepoint search constraints
+const NEAREST_MAX_COUNT    = 50;
+const NEAREST_MAX_DIST_M   = 200;
+const NEAREST_BEARING_HALF = 45;
 
-// Nearby-stops highlight constraints (independent of shapepoint search — looks at bus
-// STOP points, not route shapepoints; no bearing constraint, just straight-line distance).
-const STOP_NEARBY_MAX_DIST_M = 100;   // highlight stops within this many metres of the vehicle
+// nearby-stops highlight constraints
+const STOP_NEARBY_MAX_DIST_M = 100;
 const STOP_NEARBY_COLOR      = "#ec4899";
 
-// Vehicle trip-scoring constraints — how many of the ranked nearest shapepoints get sent
-// to the server for trip/block scoring. Independent of NEAREST_MAX_COUNT (which controls
-// what's drawn on the map); scoring is capped lower to keep each DB round-trip fast.
+// how many ranked groups get sent to /api/vehicle-score
 const SCORE_MAX_GROUPS = 15;
 
 // ── map ───────────────────────────────────────────────────────────────────────
@@ -118,14 +111,14 @@ L.tileLayer("https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png", {
   attribution: "© OpenStreetMap © CARTO", maxZoom: 19,
 }).addTo(map);
 
-// ── layers (z-order: grid → vehicle route → nearest → torch beam → nearby stops → current pos)
+// ── layers ────────────────────────────────────────────────────────────────────
 
 let gridLayer        = L.layerGroup().addTo(map);
-let vehicleLayer     = L.layerGroup().addTo(map);   // full route polyline + all dots
-let nearestLayer     = L.layerGroup().addTo(map);   // nearest shape point + connecting line
-let torchLayer       = L.layerGroup().addTo(map);   // directional beam, drawn just under the vehicle dot
-let nearbyStopsLayer = L.layerGroup().addTo(map);   // stop points within 100m of the vehicle
-let currentPosLayer  = L.layerGroup().addTo(map);   // current vehicle position (always on top)
+let vehicleLayer     = L.layerGroup().addTo(map);
+let nearestLayer     = L.layerGroup().addTo(map);
+let torchLayer       = L.layerGroup().addTo(map);
+let nearbyStopsLayer = L.layerGroup().addTo(map);
+let currentPosLayer  = L.layerGroup().addTo(map);
 let stopsCluster     = L.markerClusterGroup({ maxClusterRadius: 40, disableClusteringAtZoom: 16 });
 let individualLayer  = L.layerGroup();
 
@@ -133,7 +126,7 @@ let individualLayer  = L.layerGroup();
 
 let allStopData   = [];
 let stopMarkerMap = {};
-let cellColorMap  = {};    // "row_col" → fill color — ALL cells with stop points
+let cellColorMap  = {};
 let selectedCell  = null;
 
 let selectedStops     = new Map();
@@ -143,23 +136,20 @@ let stopsVisible   = true;
 let vehicleVisible = true;
 
 // vehicle navigator state
-let vehiclePoints = [];   // [{id,time,datetime,lat,lon,compass,routeid}] sorted by time
+let vehiclePoints = [];
 let vehicleIndex  = 0;
 let vehicleId     = null;
 
-// grid shapepoints data structure
-// populated based on the vehicle's current grid cell (not the clicked cell)
-// { cell: {row,col,...}, total, points: [{id,lat,lon}], byId: Map }
+// gridShapePoints — populated based on the vehicle's current grid cell
+// structure: { cell, total, groups: [{shapegroupid, lat, lon, shape_ids}], byGroupId: Map }
 let gridShapePoints = null;
 
 // nearest shape point result
-// { shapepoint: {id,lat,lon}, distanceM: float }
 let nearestShapepoint = null;
 
-// vehicle trip/block scoring result for the current position
-// { reference_time, compass, trips: [...], blocks: [...] }
-let vehicleScoreResult = null;
-let vehicleScoreRequestId = 0;   // guards against out-of-order responses while navigating fast
+// vehicle trip/block scoring result
+let vehicleScoreResult    = null;
+let vehicleScoreRequestId = 0;
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -167,15 +157,16 @@ function isInCell(stop, cell) {
   return stop.lat >= cell.south && stop.lat < cell.north &&
          stop.lon >= cell.west  && stop.lon < cell.east;
 }
+
 function nextRouteColor(routesMap) {
   const used = new Set([...routesMap.values()].map(e => e.color));
   return ROUTE_COLORS.find(c => !used.has(c)) || ROUTE_COLORS[routesMap.size % ROUTE_COLORS.length];
 }
+
 function activeStopRoutes() {
   return selectedStops.get(activePanelStopId)?.routes || new Map();
 }
 
-// Haversine distance in metres between two lat/lon degree points
 function haversineMeters(lat1, lon1, lat2, lon2) {
   const R  = 6_371_000;
   const φ1 = lat1 * Math.PI / 180;
@@ -187,27 +178,48 @@ function haversineMeters(lat1, lon1, lat2, lon2) {
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-// Initial bearing (azimuth, degrees 0-360) from point 1 to point 2.
-// Used to check whether a shapepoint lies within the vehicle's heading cone.
 function bearingDegrees(lat1, lon1, lat2, lon2) {
   const φ1 = lat1 * Math.PI / 180;
   const φ2 = lat2 * Math.PI / 180;
   const Δλ = (lon2 - lon1) * Math.PI / 180;
-  const y = Math.sin(Δλ) * Math.cos(φ2);
-  const x = Math.cos(φ1) * Math.sin(φ2) - Math.sin(φ1) * Math.cos(φ2) * Math.cos(Δλ);
-  const θ = Math.atan2(y, x) * 180 / Math.PI;
-  return (θ + 360) % 360;
+  const y  = Math.sin(Δλ) * Math.cos(φ2);
+  const x  = Math.cos(φ1) * Math.sin(φ2) - Math.sin(φ1) * Math.cos(φ2) * Math.cos(Δλ);
+  return (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
 }
 
-// Smallest absolute angular difference between two bearings (0-180 range).
-// Handles wraparound, e.g. diff(350, 10) === 20, not 340.
 function angleDiff(a, b) {
   const diff = Math.abs(a - b) % 360;
   return diff > 180 ? 360 - diff : diff;
 }
 
-// Given a start point, bearing (deg) and distance (m), returns the destination [lat, lon].
-// Used only for drawing the torch beam — has no relation to shapepoint/stoppoint logic.
+function arrayToCSV(data) {
+  if (!data || !data.length) return '';
+  const headers = Object.keys(data[0]);
+  const rows = data.map(row =>
+    headers.map(h => {
+      const val = row[h] ?? '';
+      const escaped = String(val).replace(/"/g, '""');
+      return /[",\n]/.test(escaped) ? `"${escaped}"` : escaped;
+    }).join(',')
+  );
+  return [headers.join(','), ...rows].join('\n');
+}
+
+function downloadCSV(data, filename) {
+  if (!data || !data.length) {
+    console.warn('[export] nothing to export');
+    return;
+  }
+  const csv  = arrayToCSV(data);
+  const blob = new Blob([csv], { type: 'text/csv' });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement('a');
+  a.href     = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
 function destPoint(lat, lon, bearingDeg, distM) {
   const R  = 6_371_000;
   const δ  = distM / R;
@@ -221,7 +233,6 @@ function destPoint(lat, lon, bearingDeg, distM) {
   return [φ2 * 180 / Math.PI, λ2 * 180 / Math.PI];
 }
 
-// Builds a fan/cone polygon centred at (lat,lon), spanning [compass-spread, compass+spread].
 function buildFanPoints(lat, lon, compassDeg, radiusM, spreadDeg = TORCH_SPREAD_DEG, steps = 24) {
   const points = [[lat, lon]];
   const start  = compassDeg - spreadDeg;
@@ -234,32 +245,20 @@ function buildFanPoints(lat, lon, compassDeg, radiusM, spreadDeg = TORCH_SPREAD_
   return points;
 }
 
-// Draws (or clears) the vehicle's directional torch beam for the given position.
-// Purely a visual/orientation aid — independent of the grid/shapepoint/stoppoint system.
 function updateTorchBeam(p) {
   torchLayer.clearLayers();
-
-  if (p.compass === null || p.compass === undefined) return; // no heading — nothing to draw
-
+  if (p.compass === null || p.compass === undefined) return;
   TORCH_LAYERS.forEach(({ radius, opacity }) => {
     const pts = buildFanPoints(p.lat, p.lon, p.compass, radius);
     L.polygon(pts, {
-      color: "transparent",
-      fillColor: TORCH_COLOR,
-      fillOpacity: opacity,
-      weight: 0,
-      interactive: false,
+      color: "transparent", fillColor: TORCH_COLOR,
+      fillOpacity: opacity, weight: 0, interactive: false,
     }).addTo(torchLayer);
   });
 }
 
-// Highlights bus stop points within STOP_NEARBY_MAX_DIST_M metres of the vehicle's
-// current position, with the live distance shown as a floating label + tooltip.
-// Independent of the shapepoint nearest-search — this looks at allStopData (stops),
-// not gridShapePoints (shapepoints), and uses plain distance with no bearing cone.
 function updateNearbyStops(p) {
   nearbyStopsLayer.clearLayers();
-
   if (!allStopData || allStopData.length === 0) return;
 
   const nearby = allStopData
@@ -268,21 +267,13 @@ function updateNearbyStops(p) {
     .sort((a, b) => a.dist - b.dist);
 
   nearby.forEach(({ s, dist }) => {
-    // highlighted stop dot
     L.circleMarker([s.lat, s.lon], {
-      radius: 8,
-      color: "#831843",
-      fillColor: STOP_NEARBY_COLOR,
-      fillOpacity: 0.95,
-      weight: 2.5,
+      radius: 8, color: "#831843", fillColor: STOP_NEARBY_COLOR,
+      fillOpacity: 0.95, weight: 2.5,
     })
-    .bindTooltip(
-      `<b>Stop ${s.id}</b><br>Distance: <b>${dist.toFixed(1)} m</b>`,
-      { sticky: true }
-    )
+    .bindTooltip(`<b>Stop ${s.id}</b><br>Distance: <b>${dist.toFixed(1)} m</b>`, { sticky: true })
     .addTo(nearbyStopsLayer);
 
-    // floating distance badge next to the dot
     L.marker([s.lat, s.lon], {
       icon: L.divIcon({
         className: "",
@@ -305,59 +296,59 @@ function updateNearbyStops(p) {
   }
 }
 
-// Returns {row, col} of the grid cell the vehicle currently occupies,
-// or null if the vehicle is not within any displayed grid cell.
 function vehicleGridCell() {
   if (vehiclePoints.length === 0) return null;
   const p   = vehiclePoints[vehicleIndex];
   const row = Math.floor(p.lat / KM_LAT);
   const col = Math.floor(p.lon / KM_LON);
-  // cellColorMap contains only cells that have stop points (loaded via /api/grid)
   return cellColorMap[`${row}_${col}`] !== undefined ? { row, col } : null;
 }
 
-// ── vehicle navigator Leaflet control ─────────────────────────────────────────
+// ── vehicle navigator control ─────────────────────────────────────────────────
 
 const VehicleNavControl = L.Control.extend({
-  options: { position: 'bottomright' },
+  options: { position: "bottomright" },
   onAdd(map) {
-    const c = L.DomUtil.create('div', 'vehicle-nav-control');
+    const c = L.DomUtil.create("div", "vehicle-nav-control");
     c.innerHTML = `
-      <button class="nav-btn" id="nav-back" disabled title="Previous position">&#8592;</button>
+      <button class="nav-btn" id="nav-back"    disabled title="Previous position">&#8592;</button>
       <div class="nav-info">
         <div class="nav-label">Vehicle <b id="nav-veh-id">—</b></div>
         <div id="nav-time"    class="nav-time">—</div>
         <div id="nav-idx"     class="nav-index">— / —</div>
         <div id="nav-compass" class="nav-compass">Compass: —</div>
         <div id="nav-score"   class="nav-score">Best match: —</div>
+        <button class="nav-btn" id="nav-export-csv" title="Download block scores as CSV" style="margin-top:6px;width:100%;">
+          ⬇ Export BLOCK SCORE CSV
+        </button>
       </div>
       <button class="nav-btn" id="nav-forward" disabled title="Next position">&#8594;</button>
     `;
     L.DomEvent.disableClickPropagation(c);
     L.DomEvent.disableScrollPropagation(c);
-    c.querySelector('#nav-back').addEventListener('click',    () => navigateVehicle(-1));
-    c.querySelector('#nav-forward').addEventListener('click', () => navigateVehicle(+1));
-
-    // Keyboard navigation (Left/Right arrow keys)
-    this._onKeyDown = (e) => {
-      // Avoid hijacking arrow keys while typing in an input/textarea
-      const tag = document.activeElement && document.activeElement.tagName;
-      if (tag === 'INPUT' || tag === 'TEXTAREA') return;
-
-      if (e.key === 'ArrowLeft') {
-        e.preventDefault();
-        navigateVehicle(-1);
-      } else if (e.key === 'ArrowRight') {
-        e.preventDefault();
-        navigateVehicle(+1);
+    c.querySelector("#nav-back").addEventListener("click",    () => navigateVehicle(-1));
+    c.querySelector("#nav-forward").addEventListener("click", () => navigateVehicle(+1));
+    c.querySelector("#nav-export-csv").addEventListener("click", () => {
+      if (!vehicleScoreResult || !vehicleScoreResult.blocks || vehicleScoreResult.blocks.length === 0) {
+        console.warn("[export] no block scores available for this position");
+        return;
       }
-    };
-    document.addEventListener('keydown', this._onKeyDown);
+      const p = vehiclePoints[vehicleIndex];
+      const filename = `blocks_veh${vehicleId}_${p.time.replace(/:/g, "-")}.csv`;
+      downloadCSV(vehicleScoreResult.blocks, filename);
+    });
 
+    this._onKeyDown = (e) => {
+      const tag = document.activeElement && document.activeElement.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA") return;
+      if (e.key === "ArrowLeft")  { e.preventDefault(); navigateVehicle(-1); }
+      if (e.key === "ArrowRight") { e.preventDefault(); navigateVehicle(+1); }
+    };
+    document.addEventListener("keydown", this._onKeyDown);
     return c;
   },
   onRemove(map) {
-    document.removeEventListener('keydown', this._onKeyDown);
+    document.removeEventListener("keydown", this._onKeyDown);
   },
 });
 
@@ -370,8 +361,6 @@ function navigateVehicle(delta) {
   if (next < 0 || next >= vehiclePoints.length) return;
   vehicleIndex = next;
   updateCurrentPosition();
-
-  // vehicle position changed → find nearest shape point in vehicle's current cell
   updateVehicleGridAndNearest();
 }
 
@@ -380,27 +369,25 @@ function updateCurrentPosition() {
   const p = vehiclePoints[vehicleIndex];
 
   currentPosLayer.clearLayers();
-  updateTorchBeam(p);     // directional beam, redrawn independently of shapepoint/stoppoint logic
-  updateNearbyStops(p);   // stops within 100m, redrawn independently of shapepoint/stoppoint logic
+  updateTorchBeam(p);
+  updateNearbyStops(p);
 
-  // outer ring
   L.circleMarker([p.lat, p.lon], {
     radius: 14, color: "#fbbf24", fillColor: "transparent", weight: 2, opacity: 0.45,
   }).addTo(currentPosLayer);
 
-  // main dot
   L.circleMarker([p.lat, p.lon], {
     radius: 9, color: "#b45309", fillColor: "#fef08a", fillOpacity: 1.0, weight: 2.5,
   })
   .bindTooltip(
     `<b>Vehicle ${p.techvhno ?? vehicleId}</b><br>` +
-    `Block:&nbsp;&nbsp; <b>${p.blockid  ?? '—'}</b><br>` +
-    `Trip:&nbsp;&nbsp;&nbsp; <b>${p.tripid   ?? '—'}</b><br>` +
-    `Route:&nbsp;&nbsp; <b>${p.routeid  ?? '—'}</b><br>` +
+    `Block:&nbsp;&nbsp; <b>${p.blockid  ?? "—"}</b><br>` +
+    `Trip:&nbsp;&nbsp;&nbsp; <b>${p.tripid   ?? "—"}</b><br>` +
+    `Route:&nbsp;&nbsp; <b>${p.routeid  ?? "—"}</b><br>` +
     `Time:&nbsp;&nbsp;&nbsp; ${p.time}<br>` +
     `Lat:&nbsp;&nbsp;&nbsp;&nbsp; ${p.lat.toFixed(6)}°<br>` +
     `Lon:&nbsp;&nbsp;&nbsp;&nbsp; ${p.lon.toFixed(6)}°<br>` +
-    `Compass: ${p.compass ?? 'N/A'}°`,
+    `Compass: ${p.compass ?? "N/A"}°`,
     { sticky: true, permanent: false }
   )
   .addTo(currentPosLayer);
@@ -412,7 +399,6 @@ function updateCurrentPosition() {
   document.getElementById("nav-back").disabled        = vehicleIndex === 0;
   document.getElementById("nav-forward").disabled     = vehicleIndex === vehiclePoints.length - 1;
 
-  // scoring for this position hasn't run yet (nearest search + DB round-trip is async)
   setScoreDisplay(null, "pending");
 }
 
@@ -423,8 +409,7 @@ async function updateVehicleGridAndNearest() {
     const vc = vehicleGridCell();
 
     if (!vc) {
-      // vehicle is not inside any displayed grid cell
-      gridShapePoints   = { cell: null, total: 0, points: [], byId: new Map() };
+      gridShapePoints   = { cell: null, total: 0, groups: [], byGroupId: new Map() };
       nearestShapepoint = null;
       nearestLayer.clearLayers();
       console.log("[gridShapePoints] vehicle not in any grid cell — storage empty");
@@ -432,12 +417,11 @@ async function updateVehicleGridAndNearest() {
       return;
     }
 
-    // only reload if vehicle moved to a different cell
     const sameCell = gridShapePoints?.cell?.row === vc.row &&
                      gridShapePoints?.cell?.col === vc.col;
 
     if (!sameCell) {
-      await loadGridShapePoints(vc);   // awaited here so nearest runs after load
+      await loadGridShapePoints(vc);
     }
 
     findNearestShapepointToVehicle();
@@ -447,33 +431,31 @@ async function updateVehicleGridAndNearest() {
   }
 }
 
+// ── loadGridShapePoints ───────────────────────────────────────────────────────
+// Fetches location groups for the vehicle's current grid cell.
+// Each group: { shapegroupid, lat, lon, shape_ids: [...] }
+// shapegroupid is sequential per request (1, 2, 3, ...) from the backend.
+
 async function loadGridShapePoints(cell) {
   try {
     const res  = await fetch(`/api/grid-shapepoints?row=${cell.row}&col=${cell.col}`);
     const data = await res.json();
 
     gridShapePoints = {
-      cell:   data.cell,
-      total:  data.total,
-      points: data.points,
-      byId:   new Map(data.points.map(p => [p.id, p])),
+      cell:      data.cell,
+      total:     data.total,           // number of location groups
+      groups:    data.groups,          // [{shapegroupid, lat, lon, shape_ids}]
+      byGroupId: new Map(data.groups.map(g => [g.shapegroupid, g])),
     };
 
-    // ── log 1: summary ───────────────────────────────────────────
+    // ── log 1: summary ────────────────────────────────────────────────────────
     console.log(
-      `%c[gridShapePoints] vehicle cell (${cell.row},${cell.col}) → ${gridShapePoints.total} shape points ready`,
+      `%c[gridShapePoints] cell (${cell.row},${cell.col}) → ${data.total} location groups ready`,
       "color:#38bdf8;font-weight:bold;"
     );
 
-    // ── log 2: expandable object ──────────────────────────────────
+    // ── log 2: expandable full object ─────────────────────────────────────────
     console.log("[gridShapePoints] full object →", gridShapePoints);
-
-    // ── log 3: expandable points array only ───────────────────────
-    console.log("[gridShapePoints] points →", data.points);
-
-    // ── log 4: shapeids as expandable array ───────────────────────
-    const shapeids = data.points.map(p => p.id);
-    console.log("[gridShapePoints] shapeids →", shapeids);
 
   } catch (err) {
     console.error("[loadGridShapePoints] failed:", err);
@@ -481,17 +463,18 @@ async function loadGridShapePoints(cell) {
   }
 }
 
-// Finds up to NEAREST_MAX_COUNT shapepoints that are:
-//   - within NEAREST_MAX_DIST_M metres of the vehicle, AND
-//   - within a bearing cone of ± NEAREST_BEARING_HALF degrees around the vehicle's compass heading.
-// Results are ranked nearest-first. If the vehicle has no compass reading, the bearing
-// constraint can't be evaluated, so no candidates are shown (rather than guessing a direction).
+// ── findNearestShapepointToVehicle ───────────────────────────────────────────
+// Filters location groups within NEAREST_MAX_DIST_M and ±NEAREST_BEARING_HALF
+// of the vehicle's compass heading. Each group has ONE lat/lon → ONE distance
+// and bearing → ONE distance_score + heading_score shared for all its shape_ids.
+// schedule_score is computed per-trip on the backend independently.
+
 function findNearestShapepointToVehicle() {
   nearestLayer.clearLayers();
 
-  if (!gridShapePoints || gridShapePoints.points.length === 0 || vehiclePoints.length === 0) {
+  if (!gridShapePoints || gridShapePoints.groups.length === 0 || vehiclePoints.length === 0) {
     nearestShapepoint = null;
-    clearVehicleScore("no shapepoints in cell");
+    clearVehicleScore("no shapepoint groups in cell");
     return;
   }
 
@@ -504,178 +487,139 @@ function findNearestShapepointToVehicle() {
     return;
   }
 
-  const ranked = gridShapePoints.points
-    .map(sp => ({
-      sp,
-      dist:    haversineMeters(vp.lat, vp.lon, sp.lat, sp.lon),
-      bearing: bearingDegrees(vp.lat, vp.lon, sp.lat, sp.lon),
+  // ── step 1: compute distance + bearing per GROUP ──────────────────────────
+  const rankedGroups = gridShapePoints.groups
+    .map(g => ({
+      g,
+      dist:    haversineMeters(vp.lat, vp.lon, g.lat, g.lon),
+      bearing: bearingDegrees(vp.lat, vp.lon, g.lat, g.lon),
     }))
     .sort((a, b) => a.dist - b.dist)
-    .filter(({ dist })    => dist <= NEAREST_MAX_DIST_M)
+    .filter(({ dist })    => dist    <= NEAREST_MAX_DIST_M)
     .filter(({ bearing }) => angleDiff(bearing, vp.compass) <= NEAREST_BEARING_HALF);
 
-  if (ranked.length === 0) {
+  if (rankedGroups.length === 0) {
     nearestShapepoint = null;
-    console.log("[nearest] no shapepoints within 200m / ±45° of compass heading");
+    console.log("[nearest] no groups within 200m / ±45° of compass heading");
     clearVehicleScore("no shapepoints in range");
     return;
   }
 
-  // store the closest one for external use
-  nearestShapepoint = { shapepoint: ranked[0].sp, distanceM: ranked[0].dist };
+  // store closest group's first shape_id as representative
+  const closest     = rankedGroups[0];
+  nearestShapepoint = {
+    shapepoint: { id: closest.g.shape_ids[0], lat: closest.g.lat, lon: closest.g.lon },
+    distanceM:  closest.dist,
+  };
 
-  // ─────────────────────────────────────────────────────────────────
-  //  CONSOLE OUTPUT 1 — SHAPE_GROUPS
-  //  groups shapepoints by rounded distance+bearing bucket
-  // ─────────────────────────────────────────────────────────────────
-  const DIST_BUCKET  = 10;   // group points within 10m of each other
-  const groups = [];
+  // ── step 2: console — one line per group ──────────────────────────────────
+  console.log("%c[nearest groups found]", "color:#38bdf8;font-weight:bold;");
 
-  ranked.forEach(({ sp, dist, bearing }) => {
-    // find existing group within bucket range
-    const existing = groups.find(g =>
-      Math.abs(g._dist - dist) <= DIST_BUCKET
-    );
-    if (existing) {
-      existing.shape_ids.push(sp.id);
-    } else {
-      groups.push({
-        _dist     : dist,                        // internal for bucketing
-        distance  : parseFloat(dist.toFixed(1)),
-        bearing   : parseFloat(bearing.toFixed(1)),
-        shape_ids : [sp.id],
-      });
-    }
-  });
+  // ── step 3: expandable object for drilling down ───────────────────────────
+  console.log("[nearest] ranked groups →", rankedGroups.map(({ g, dist, bearing }) => ({
+    shapegroupid: g.shapegroupid,
+    lat:          g.lat,
+    lon:          g.lon,
+    dist_m:       parseFloat(dist.toFixed(1)),
+    bearing_deg:  parseFloat(bearing.toFixed(1)),
+    shape_ids:    g.shape_ids,
+  })));
 
-  // print SHAPE_GROUPS
-  const shapeGroupsStr = groups.map(g => {
-    const idsFormatted = g.shape_ids
-      .map((id, i) => (i % 4 === 0 ? '\n            ' : '') + id)
-      .join(', ');
-    return (
-      `    {\n` +
-      `        'distance': ${g.distance}, 'bearing': ${g.bearing}, 'shape_ids': [` +
-      `${idsFormatted},\n        ]\n    }`
-    );
-  }).join(',\n');
-
-  console.log("Nearest shapeids: ")
-  console.log(
-    `%cSHAPE_GROUPS = [\n${shapeGroupsStr}\n]`,
-    "color:#38bdf8; font-family:monospace;"
-  );
-
-  // ─────────────────────────────────────────────────────────────────
-  //  CONSOLE OUTPUT 2 — flat shapeids list
-  // ─────────────────────────────────────────────────────────────────
-  const allIds     = ranked.map(({ sp }) => sp.id);
-  const idsChunked = [];
-  for (let i = 0; i < allIds.length; i += 4) {
-    idsChunked.push('    ' + allIds.slice(i, i + 4).join(', ') + ',');
-  }
-
-  console.log(
-    `%cshapeids = [\n${idsChunked.join('\n')}\n]`,
-    "color:#4ade80; font-family:monospace;"
-  );
-
-  // ─────────────────────────────────────────────────────────────────
-  //  EXISTING visual rendering — unchanged
-  // ─────────────────────────────────────────────────────────────────
+  // ── step 4: visual — one marker per GROUP ─────────────────────────────────
   const RANKS = [
-    { label: "1st nearest",  radius: 6, color: "#a21caf", fill: "#e879f9", lineW: 2,    lineOp: 0.85 },
-    { label: "2nd nearest",  radius: 6, color: "#7e22ce", fill: "#c084fc", lineW: 1.5,  lineOp: 0.55 },
-    { label: "3rd nearest",  radius: 6, color: "#4c1d95", fill: "#a78bfa", lineW: 1,    lineOp: 0.35 },
-    { label: "4th nearest",  radius: 6, color: "#312e81", fill: "#818cf8", lineW: 0.75, lineOp: 0.25 },
-    { label: "5th nearest",  radius: 6, color: "#1e1b4b", fill: "#6366f1", lineW: 0.5,  lineOp: 0.18 },
-    { label: "6th nearest",  radius: 5, color: "#1e3a5f", fill: "#38bdf8", lineW: 0.45, lineOp: 0.15 },
-    { label: "7th nearest",  radius: 5, color: "#164e63", fill: "#22d3ee", lineW: 0.4,  lineOp: 0.13 },
-    { label: "8th nearest",  radius: 5, color: "#065f46", fill: "#34d399", lineW: 0.35, lineOp: 0.11 },
-    { label: "9th nearest",  radius: 4, color: "#14532d", fill: "#86efac", lineW: 0.3,  lineOp: 0.09 },
-    { label: "10th nearest", radius: 4, color: "#1a2e05", fill: "#bef264", lineW: 0.25, lineOp: 0.07 },
-    { label: "11th nearest", radius: 4, color: "#134e4a", fill: "#2dd4bf", lineW: 0.23, lineOp: 0.07 },
-    { label: "12th nearest", radius: 4, color: "#115e59", fill: "#5eead4", lineW: 0.22, lineOp: 0.06 },
-    { label: "13th nearest", radius: 4, color: "#0f766e", fill: "#99f6e4", lineW: 0.21, lineOp: 0.06 },
-    { label: "14th nearest", radius: 3, color: "#0d9488", fill: "#ccfbf1", lineW: 0.20, lineOp: 0.06 },
-    { label: "15th nearest", radius: 3, color: "#0891b2", fill: "#a5f3fc", lineW: 0.19, lineOp: 0.05 },
-    { label: "16th nearest", radius: 3, color: "#166534", fill: "#86efac", lineW: 0.18, lineOp: 0.05 },
-    { label: "17th nearest", radius: 3, color: "#14532d", fill: "#4ade80", lineW: 0.17, lineOp: 0.05 },
-    { label: "18th nearest", radius: 3, color: "#15803d", fill: "#bbf7d0", lineW: 0.16, lineOp: 0.05 },
-    { label: "19th nearest", radius: 3, color: "#16a34a", fill: "#dcfce7", lineW: 0.15, lineOp: 0.05 },
-    { label: "20th nearest", radius: 3, color: "#365314", fill: "#d9f99d", lineW: 0.14, lineOp: 0.04 },
-    { label: "21st nearest", radius: 3, color: "#3f6212", fill: "#bef264", lineW: 0.13, lineOp: 0.04 },
-    { label: "22nd nearest", radius: 3, color: "#4d7c0f", fill: "#a3e635", lineW: 0.13, lineOp: 0.04 },
-    { label: "23rd nearest", radius: 3, color: "#713f12", fill: "#fde68a", lineW: 0.12, lineOp: 0.04 },
-    { label: "24th nearest", radius: 3, color: "#78350f", fill: "#fcd34d", lineW: 0.12, lineOp: 0.04 },
-    { label: "25th nearest", radius: 3, color: "#92400e", fill: "#fbbf24", lineW: 0.11, lineOp: 0.04 },
-    { label: "26th nearest", radius: 2, color: "#9a3412", fill: "#fdba74", lineW: 0.11, lineOp: 0.04 },
-    { label: "27th nearest", radius: 2, color: "#7c2d12", fill: "#fb923c", lineW: 0.10, lineOp: 0.03 },
-    { label: "28th nearest", radius: 2, color: "#6b2117", fill: "#f97316", lineW: 0.10, lineOp: 0.03 },
-    { label: "29th nearest", radius: 2, color: "#991b1b", fill: "#fca5a5", lineW: 0.09, lineOp: 0.03 },
-    { label: "30th nearest", radius: 2, color: "#7f1d1d", fill: "#f87171", lineW: 0.09, lineOp: 0.03 },
-    { label: "31st nearest", radius: 2, color: "#881337", fill: "#fda4af", lineW: 0.08, lineOp: 0.03 },
-    { label: "32nd nearest", radius: 2, color: "#9f1239", fill: "#fb7185", lineW: 0.08, lineOp: 0.03 },
-    { label: "33rd nearest", radius: 2, color: "#be123c", fill: "#fecdd3", lineW: 0.08, lineOp: 0.03 },
-    { label: "34th nearest", radius: 2, color: "#4c0519", fill: "#fda4af", lineW: 0.07, lineOp: 0.03 },
-    { label: "35th nearest", radius: 2, color: "#500724", fill: "#fbcfe8", lineW: 0.07, lineOp: 0.02 },
-    { label: "36th nearest", radius: 2, color: "#701a75", fill: "#f0abfc", lineW: 0.07, lineOp: 0.02 },
-    { label: "37th nearest", radius: 2, color: "#86198f", fill: "#e879f9", lineW: 0.06, lineOp: 0.02 },
-    { label: "38th nearest", radius: 2, color: "#6b21a8", fill: "#d946ef", lineW: 0.06, lineOp: 0.02 },
-    { label: "39th nearest", radius: 2, color: "#581c87", fill: "#c026d3", lineW: 0.06, lineOp: 0.02 },
-    { label: "40th nearest", radius: 2, color: "#3b0764", fill: "#a855f7", lineW: 0.05, lineOp: 0.02 },
-    { label: "41st nearest", radius: 2, color: "#1e293b", fill: "#94a3b8", lineW: 0.05, lineOp: 0.02 },
-    { label: "42nd nearest", radius: 2, color: "#0f172a", fill: "#cbd5e1", lineW: 0.05, lineOp: 0.02 },
-    { label: "43rd nearest", radius: 2, color: "#1e1e2e", fill: "#e2e8f0", lineW: 0.04, lineOp: 0.02 },
-    { label: "44th nearest", radius: 2, color: "#18181b", fill: "#d4d4d8", lineW: 0.04, lineOp: 0.01 },
-    { label: "45th nearest", radius: 2, color: "#27272a", fill: "#a1a1aa", lineW: 0.04, lineOp: 0.01 },
-    { label: "46th nearest", radius: 1, color: "#3f3f46", fill: "#71717a", lineW: 0.03, lineOp: 0.01 },
-    { label: "47th nearest", radius: 1, color: "#52525b", fill: "#a8a29e", lineW: 0.03, lineOp: 0.01 },
-    { label: "48th nearest", radius: 1, color: "#44403c", fill: "#d6d3d1", lineW: 0.03, lineOp: 0.01 },
-    { label: "49th nearest", radius: 1, color: "#292524", fill: "#e7e5e4", lineW: 0.02, lineOp: 0.01 },
-    { label: "50th nearest", radius: 1, color: "#1c1917", fill: "#f5f5f4", lineW: 0.02, lineOp: 0.01 },
+    { label: "1st nearest",  radius: 6, color: "#a21caf", fill: "#e879f9" },
+    { label: "2nd nearest",  radius: 6, color: "#7e22ce", fill: "#c084fc" },
+    { label: "3rd nearest",  radius: 6, color: "#4c1d95", fill: "#a78bfa" },
+    { label: "4th nearest",  radius: 6, color: "#312e81", fill: "#818cf8" },
+    { label: "5th nearest",  radius: 6, color: "#1e1b4b", fill: "#6366f1" },
+    { label: "6th nearest",  radius: 5, color: "#1e3a5f", fill: "#38bdf8" },
+    { label: "7th nearest",  radius: 5, color: "#164e63", fill: "#22d3ee" },
+    { label: "8th nearest",  radius: 5, color: "#065f46", fill: "#34d399" },
+    { label: "9th nearest",  radius: 4, color: "#14532d", fill: "#86efac" },
+    { label: "10th nearest", radius: 4, color: "#1a2e05", fill: "#bef264" },
+    { label: "11th nearest", radius: 4, color: "#134e4a", fill: "#2dd4bf" },
+    { label: "12th nearest", radius: 4, color: "#115e59", fill: "#5eead4" },
+    { label: "13th nearest", radius: 4, color: "#0f766e", fill: "#99f6e4" },
+    { label: "14th nearest", radius: 3, color: "#0d9488", fill: "#ccfbf1" },
+    { label: "15th nearest", radius: 3, color: "#0891b2", fill: "#a5f3fc" },
+    { label: "16th nearest", radius: 3, color: "#166534", fill: "#86efac" },
+    { label: "17th nearest", radius: 3, color: "#14532d", fill: "#4ade80" },
+    { label: "18th nearest", radius: 3, color: "#15803d", fill: "#bbf7d0" },
+    { label: "19th nearest", radius: 3, color: "#16a34a", fill: "#dcfce7" },
+    { label: "20th nearest", radius: 3, color: "#365314", fill: "#d9f99d" },
+    { label: "21st nearest", radius: 3, color: "#3f6212", fill: "#bef264" },
+    { label: "22nd nearest", radius: 3, color: "#4d7c0f", fill: "#a3e635" },
+    { label: "23rd nearest", radius: 3, color: "#713f12", fill: "#fde68a" },
+    { label: "24th nearest", radius: 3, color: "#78350f", fill: "#fcd34d" },
+    { label: "25th nearest", radius: 3, color: "#92400e", fill: "#fbbf24" },
+    { label: "26th nearest", radius: 2, color: "#9a3412", fill: "#fdba74" },
+    { label: "27th nearest", radius: 2, color: "#7c2d12", fill: "#fb923c" },
+    { label: "28th nearest", radius: 2, color: "#6b2117", fill: "#f97316" },
+    { label: "29th nearest", radius: 2, color: "#991b1b", fill: "#fca5a5" },
+    { label: "30th nearest", radius: 2, color: "#7f1d1d", fill: "#f87171" },
+    { label: "31st nearest", radius: 2, color: "#881337", fill: "#fda4af" },
+    { label: "32nd nearest", radius: 2, color: "#9f1239", fill: "#fb7185" },
+    { label: "33rd nearest", radius: 2, color: "#be123c", fill: "#fecdd3" },
+    { label: "34th nearest", radius: 2, color: "#4c0519", fill: "#fda4af" },
+    { label: "35th nearest", radius: 2, color: "#500724", fill: "#fbcfe8" },
+    { label: "36th nearest", radius: 2, color: "#701a75", fill: "#f0abfc" },
+    { label: "37th nearest", radius: 2, color: "#86198f", fill: "#e879f9" },
+    { label: "38th nearest", radius: 2, color: "#6b21a8", fill: "#d946ef" },
+    { label: "39th nearest", radius: 2, color: "#581c87", fill: "#c026d3" },
+    { label: "40th nearest", radius: 2, color: "#3b0764", fill: "#a855f7" },
+    { label: "41st nearest", radius: 2, color: "#1e293b", fill: "#94a3b8" },
+    { label: "42nd nearest", radius: 2, color: "#0f172a", fill: "#cbd5e1" },
+    { label: "43rd nearest", radius: 2, color: "#1e1e2e", fill: "#e2e8f0" },
+    { label: "44th nearest", radius: 2, color: "#18181b", fill: "#d4d4d8" },
+    { label: "45th nearest", radius: 2, color: "#27272a", fill: "#a1a1aa" },
+    { label: "46th nearest", radius: 1, color: "#3f3f46", fill: "#71717a" },
+    { label: "47th nearest", radius: 1, color: "#52525b", fill: "#a8a29e" },
+    { label: "48th nearest", radius: 1, color: "#44403c", fill: "#d6d3d1" },
+    { label: "49th nearest", radius: 1, color: "#292524", fill: "#e7e5e4" },
+    { label: "50th nearest", radius: 1, color: "#1c1917", fill: "#f5f5f4" },
   ];
 
-  ranked.forEach(({ sp, dist, bearing }, idx) => {
-    const s = RANKS[Math.min(idx, RANKS.length - 1)];
-    L.circleMarker([sp.lat, sp.lon], {
+  rankedGroups.forEach(({ g, dist, bearing }, idx) => {
+    const s = RANKS[idx] || RANKS[RANKS.length - 1];
+
+    // one dot per group at the group's lat/lon
+    L.circleMarker([g.lat, g.lon], {
       radius: s.radius, color: s.color, fillColor: s.fill,
       fillOpacity: 1.0, weight: 2.5,
     })
     .bindTooltip(
       `<b>${s.label}</b><br>` +
-      `ID: ${sp.id}<br>` +
-      `${sp.lat.toFixed(6)}°, ${sp.lon.toFixed(6)}°<br>` +
+      `Group ID: ${g.shapegroupid}<br>` +
+      `Shape IDs: [${g.shape_ids.join(", ")}]<br>` +
+      `${g.lat.toFixed(6)}°, ${g.lon.toFixed(6)}°<br>` +
       `Distance: <b>${dist.toFixed(1)} m</b><br>` +
       `Bearing: <b>${bearing.toFixed(1)}°</b>`,
       { sticky: true }
     )
     .addTo(nearestLayer);
 
-    L.marker([sp.lat, sp.lon], {
+    // rank badge
+    L.marker([g.lat, g.lon], {
       icon: L.divIcon({
         className: "",
         html: `<span style="background:${s.color};color:#fff;font-size:10px;font-weight:700;` +
-              `padding:1px 5px;border-radius:8px;white-space:nowrap;pointer-events:none;"` +
-              `>#${idx + 1}</span>`,
+              `padding:1px 5px;border-radius:8px;white-space:nowrap;pointer-events:none;">` +
+              `#${idx + 1}</span>`,
         iconAnchor: [-10, 6],
       }),
       interactive: false,
     }).addTo(nearestLayer);
   });
 
-  scoreVehiclePosition(vp, ranked);
+  // ── step 5: send ranked groups to scoring ─────────────────────────────────
+  scoreVehiclePosition(vp, rankedGroups);
 }
 
 // ── vehicle trip/block scoring ────────────────────────────────────────────────
 
-// Sets the "Best match" line in the vehicle nav control. state is one of:
-// "pending" (scoring in flight/not yet run), "none" (ran, no candidates), or
-// omitted (a real result is being shown).
 function setScoreDisplay(result, state) {
   const el = document.getElementById("nav-score");
   if (!el) return;
-
   if (state === "pending") {
     el.textContent = "Best match: scoring…";
     el.className   = "nav-score nav-score-pending";
@@ -686,8 +630,7 @@ function setScoreDisplay(result, state) {
     el.className   = "nav-score nav-score-none";
     return;
   }
-
-  const top = result.blocks[0];
+  const top      = result.blocks[0];
   el.textContent = `Best match: Block ${top.blockid} (${(top.block_score * 100).toFixed(0)}%)`;
   el.className   = "nav-score nav-score-ok";
 }
@@ -698,39 +641,40 @@ function clearVehicleScore(reason) {
   console.log(`%c[vehicle-score] cleared — ${reason}`, "color:#94a3b8;");
 }
 
-// Groups the ranked shapepoints (each already has its own distance + bearing from the
-// vehicle) into scoring groups and posts them to /api/vehicle-score. Mirrors the offline
-// scoring script: shapepoint(s) → PSID → routeid/patternid → blockid/tripid, scored on
-// distance, heading (vs vehicle compass) and schedule (vs vehicle's current DATE_TIME).
-async function scoreVehiclePosition(vp, ranked) {
-  if (!ranked || ranked.length === 0 || !vp.datetime) {
+// Sends ranked groups to /api/vehicle-score.
+// Each group entry carries its own distance + bearing → backend computes
+// distance_score + heading_score once per group, schedule_score per tripid.
+
+async function scoreVehiclePosition(vp, rankedGroups) {
+  if (!rankedGroups || rankedGroups.length === 0 || !vp.datetime) {
     clearVehicleScore("nothing to score");
     return;
   }
 
-  const groups = ranked.map(({ sp, dist, bearing }) => ({
-    distance:  dist,
-    bearing:   bearing,
-    shape_ids: [sp.id],
-  }));
+  // one entry per ranked group — shape_ids share distance_score + heading_score
+  const groups = rankedGroups
+    .map(({ g, dist, bearing }) => ({
+      distance:  dist,
+      bearing:   bearing,
+      shape_ids: g.shape_ids,   // all shape_ids for this location group
+    }));
 
-
-  const requestId = ++vehicleScoreRequestId;   // guard against stale/out-of-order responses
+  const requestId = ++vehicleScoreRequestId;
   setScoreDisplay(null, "pending");
 
   try {
     const res = await fetch("/api/vehicle-score", {
-      method: "POST",
+      method:  "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         groups,
         reference_time: vp.datetime,
-        compass: vp.compass,
+        compass:        vp.compass,
       }),
     });
     const data = await res.json();
 
-    if (requestId !== vehicleScoreRequestId) return;  // a newer position was navigated to meanwhile
+    if (requestId !== vehicleScoreRequestId) return;
 
     if (!res.ok) {
       console.error("[vehicle-score] request failed:", data.error || res.status);
@@ -885,9 +829,6 @@ async function openCellPanel(cell, rect) {
   selectedCell = { ...cell, rect };
 
   switchToIndividual(cell);
-
-  // Store shape points for the vehicle's current cell (NOT the clicked cell),
-  // then find the nearest shape point to the vehicle's current position.
   updateVehicleGridAndNearest();
 
   setPanelTitle(`Cell (${cell.row}, ${cell.col})`, null);
@@ -1102,8 +1043,8 @@ async function toggleRoute(routeId, patternId, rowEl) {
   rowEl.classList.add("route-loading");
 
   try {
-    const res  = await fetch(`/api/route-geometry?routeid=${routeId}&patternid=${patternId}`);
-    const data = await res.json();
+    const res   = await fetch(`/api/route-geometry?routeid=${routeId}&patternid=${patternId}`);
+    const data  = await res.json();
     const layer = L.layerGroup().addTo(map);
     drawRouteOnLayer(data, layer);
     routes.set(key, { routeId, patternId, color, layer, data });
@@ -1262,8 +1203,8 @@ function toggleStops() {
 
 (async function boot() {
   await Promise.all([loadGrid(), loadStops(), loadVehicleRoute()]);
-  updateCurrentPosition();   // redraw now that stops are loaded, so nearby-stops highlight is correct
-  updateVehicleGridAndNearest();  // run the initial nearest-shapepoint + trip/block score
+  updateCurrentPosition();
+  updateVehicleGridAndNearest();
   document.getElementById("loading-overlay").classList.add("hidden");
 })();
 
