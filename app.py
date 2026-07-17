@@ -27,6 +27,15 @@ SCORE_WEIGHT_DISTANCE = 0.40
 SCORE_WEIGHT_HEADING  = 0.35
 SCORE_WEIGHT_SCHEDULE = 0.25
 
+# ── confidence-tracker constants ─────────────────────────────────────────────
+
+CONF_PRESENT_PREV_WEIGHT      = 0.6
+CONF_PRESENT_CURRENT_WEIGHT   = 0.4
+CONF_NEW_CANDIDATE_SEED       = 0.5
+CONF_EVICTION_THRESHOLD       = 0.05
+CONF_REVERSAL_ANGLE_THRESHOLD = 120.0
+CONF_REVERSAL_PENALTY_FACTOR  = 0.3
+
 # ── Riyadh bounding box ──────────────────────────────────────────────────────
 
 RIYADH_MIN_LAT = 24.45
@@ -38,13 +47,22 @@ RIYADH_MAX_LON = 46.95
 
 TECHVHNO        = 2071
 BLOCKID         = 1992
-TRIPID          = 43581
-TARGET_DATETIME = "16-MAY-2026 05.11.50"
+TRIPID          = 43582
+TARGET_DATETIME = "16-MAY-2026 05.35.52"
 CSV_PATH        = r"C:\Users\ShivangGupta\Downloads\vehicleposition\vehicleposition\16may.csv"
 
 # ── server-side cell shapepoints data structure ──────────────────────────────
 
 _cell_shapepoints = {"cell": None, "total": 0, "groups": []}
+
+# ── server-side confidence-tracker state ─────────────────────────────────────
+# blockid -> {confidence, consecutive_hits, consecutive_misses, trip_id,
+#             trip_count, last_score}
+# Global on purpose (per suggest_connectors decision: server-side, shared
+# across reloads/tabs) — same pattern as _cell_shapepoints above.
+
+_confidence_table        = {}
+_confidence_last_bearing = {"value": None}
 
 print("Loading vehicle positions from CSV...")
 
@@ -249,6 +267,114 @@ def _score_get_trips(dsdb, combos, serviceday, reference_time_str):
     if not frames:
         return pd.DataFrame(columns=["blockid", "tripid", "sched_trip_start_time", "routeid", "patternid"])
     return pd.concat(frames, ignore_index=True)
+
+
+# ── confidence tracker ────────────────────────────────────────────────────────
+
+def _confidence_decay_rate(consecutive_misses):
+    """Progressive decay: gentle for a single miss, harsher the longer it's missed."""
+    return max(0.30, 0.85 - 0.15 * (consecutive_misses - 1))
+
+
+def _confidence_bearing_delta(current_bearing, previous_bearing):
+    """Smallest angle (0-180) between two compass bearings, wrap-around safe."""
+    diff = abs(current_bearing - previous_bearing) % 360
+    return min(diff, 360 - diff)
+
+
+def _confidence_apply_reversal(current_compass):
+    """
+    If the vehicle's heading swung more than CONF_REVERSAL_ANGLE_THRESHOLD
+    since the last included observation, multiply every tracked block's
+    confidence by CONF_REVERSAL_PENALTY_FACTOR. Updates the stored bearing
+    regardless. Returns True if the penalty fired.
+    """
+    previous_compass = _confidence_last_bearing["value"]
+    fired = False
+
+    if previous_compass is not None and current_compass is not None:
+        if _confidence_bearing_delta(current_compass, previous_compass) > CONF_REVERSAL_ANGLE_THRESHOLD:
+            for s in _confidence_table.values():
+                s["confidence"] *= CONF_REVERSAL_PENALTY_FACTOR
+            fired = True
+
+    if current_compass is not None:
+        _confidence_last_bearing["value"] = current_compass
+
+    return fired
+
+
+def _confidence_update(blocks):
+    """
+    Applies one observation's block list to _confidence_table in place.
+    `blocks` is a list of dicts, each with at least: blockid, block_score,
+    trip_id, trip_count. Returns the list of evicted blockids.
+    """
+    seen = {int(b["blockid"]): b for b in blocks}
+    seen_ids    = set(seen.keys())
+    tracked_ids = set(_confidence_table.keys())
+
+    # (a) present again — EMA update
+    for bid in seen_ids & tracked_ids:
+        s = _confidence_table[bid]
+        score = float(seen[bid]["block_score"])
+        s["confidence"] = (
+            CONF_PRESENT_PREV_WEIGHT * s["confidence"]
+            + CONF_PRESENT_CURRENT_WEIGHT * score
+        )
+        s["consecutive_hits"]   += 1
+        s["consecutive_misses"]  = 0
+        s["trip_id"]    = seen[bid].get("trip_id")
+        s["trip_count"] = seen[bid].get("trip_count")
+        s["last_score"] = score
+
+    # (b) brand new candidate — conservative seed
+    for bid in seen_ids - tracked_ids:
+        score = float(seen[bid]["block_score"])
+        _confidence_table[bid] = {
+            "confidence": score * CONF_NEW_CANDIDATE_SEED,
+            "consecutive_hits": 1,
+            "consecutive_misses": 0,
+            "trip_id": seen[bid].get("trip_id"),
+            "trip_count": seen[bid].get("trip_count"),
+            "last_score": score,
+        }
+
+    # (c) missed this round — progressive decay
+    for bid in tracked_ids - seen_ids:
+        s = _confidence_table[bid]
+        s["consecutive_misses"] += 1
+        s["consecutive_hits"]    = 0
+        s["confidence"] *= _confidence_decay_rate(s["consecutive_misses"])
+        s["last_score"] = None
+
+    # clip to [0, 1]
+    for s in _confidence_table.values():
+        s["confidence"] = min(1.0, max(0.0, s["confidence"]))
+
+    # evict below threshold
+    evicted = [bid for bid, s in _confidence_table.items() if s["confidence"] < CONF_EVICTION_THRESHOLD]
+    for bid in evicted:
+        del _confidence_table[bid]
+
+    return evicted
+
+
+def _confidence_table_out():
+    rows = [
+        {
+            "blockid":            bid,
+            "trip_id":            s.get("trip_id"),
+            "confidence":         round(s["confidence"], 4),
+            "consecutive_hits":   s["consecutive_hits"],
+            "consecutive_misses": s["consecutive_misses"],
+            "trip_count":         s.get("trip_count"),
+            "last_score":         round(s["last_score"], 4) if s.get("last_score") is not None else None,
+        }
+        for bid, s in _confidence_table.items()
+    ]
+    rows.sort(key=lambda r: r["confidence"], reverse=True)
+    return rows
 
 
 # ── routes ───────────────────────────────────────────────────────────────────
@@ -600,6 +726,11 @@ def api_vehicle_score():
     grid-shapepoints response. All shape_ids within a group share the same
     distance_score and heading_score (computed once per group). schedule_score
     is computed independently per tripid regardless of group.
+
+    Block-level output also carries `trip_id` — the tripid that achieved
+    that block's max_trip_score — so the confidence tracker (and the
+    console.table view) always know which specific trip to associate with
+    the winning block.
     """
     payload            = request.get_json(silent=True) or {}
     groups             = payload.get("groups", [])
@@ -690,6 +821,12 @@ def api_vehicle_score():
     block_scores["block_score"] = np.clip(
         block_scores["max_trip_score"] + block_scores["bonus"], 0.0, 1.0
     )
+
+    # tripid that achieved max_trip_score, per block
+    best_idx      = final.groupby("blockid")["final_score"].idxmax()
+    best_trip_map = final.loc[best_idx].set_index("blockid")["tripid"].to_dict()
+    block_scores["trip_id"] = block_scores["blockid"].map(best_trip_map)
+
     block_scores = block_scores.sort_values(by="block_score", ascending=False, ignore_index=True)
 
     trips_out = [
@@ -712,6 +849,7 @@ def api_vehicle_score():
     blocks_out = [
         {
             "blockid":        int(r.blockid),
+            "trip_id":        int(r.trip_id),
             "max_trip_score": round(float(r.max_trip_score), 4),
             "trip_count":     int(r.trip_count),
             "bonus":          round(float(r.bonus),          4),
@@ -732,6 +870,57 @@ def api_vehicle_score():
         "trips":          trips_out,
         "blocks":         blocks_out,
     })
+
+
+@app.route("/api/confidence", methods=["GET"])
+def api_confidence_get():
+    return jsonify({
+        "table":        _confidence_table_out(),
+        "last_bearing": _confidence_last_bearing["value"],
+    })
+
+
+@app.route("/api/confidence/include", methods=["POST"])
+def api_confidence_include():
+    """
+    Feeds one observation's block scores into the server-side confidence
+    tracker. Expects JSON body:
+      { "blocks": [ {blockid, trip_id, block_score, trip_count, ...}, ... ],
+        "compass": 225 }
+
+    Runs the bearing-reversal check first (against the compass stored from
+    the previous included observation), then the present/new/missed update,
+    then clips and evicts. Returns the updated table plus what happened.
+    """
+    payload = request.get_json(silent=True) or {}
+    blocks  = payload.get("blocks", [])
+    compass = payload.get("compass")
+
+    if compass is not None:
+        compass = float(compass)
+
+    reversal_fired = _confidence_apply_reversal(compass)
+    evicted        = _confidence_update(blocks)
+    table           = _confidence_table_out()
+
+    print(
+        f"[confidence] included {len(blocks)} block(s) · "
+        f"reversal={reversal_fired} · evicted={evicted}"
+    )
+
+    return jsonify({
+        "table":          table,
+        "reversal_fired": reversal_fired,
+        "evicted":        evicted,
+    })
+
+
+@app.route("/api/confidence/reset", methods=["POST"])
+def api_confidence_reset():
+    _confidence_table.clear()
+    _confidence_last_bearing["value"] = None
+    print("[confidence] table reset")
+    return jsonify({"table": []})
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@
   <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css"/>
   <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css"/>
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <link rel="icon" href="data:,">
   <style>
     .nav-score {
       margin-top: 4px;
@@ -20,6 +21,54 @@
     .nav-score-pending { color: #92400e; background: #fef3c7; }
     .nav-score-ok      { color: #166534; background: #dcfce7; }
     .nav-score-none    { color: #64748b; background: #f1f5f9; }
+
+    /* ── confidence tracker panel ─────────────────────────────────────────── */
+    .confidence-control {
+      background: #ffffff;
+      border-radius: 8px;
+      box-shadow: 0 1px 5px rgba(0,0,0,0.35);
+      padding: 8px 10px;
+      font-size: 11px;
+      width: 320px;
+      max-height: 260px;
+      display: flex;
+      flex-direction: column;
+    }
+    .confidence-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-weight: 700;
+      font-size: 12px;
+      color: #1F4E5C;
+      margin-bottom: 6px;
+    }
+    .confidence-header button {
+      font-size: 10px;
+      padding: 2px 8px;
+      border-radius: 5px;
+      border: 1px solid #cbd5e1;
+      background: #f8fafc;
+      cursor: pointer;
+    }
+    .confidence-header button:hover { background: #f1f5f9; }
+    #conf-table-wrap { overflow-y: auto; max-height: 210px; }
+    #conf-table { width: 100%; border-collapse: collapse; }
+    #conf-table th, #conf-table td {
+      text-align: left;
+      padding: 3px 5px;
+      border-bottom: 1px solid #e2e8f0;
+      white-space: nowrap;
+    }
+    #conf-table th { color: #64748b; font-weight: 600; position: sticky; top: 0; background: #fff; }
+    .conf-bar {
+      display: inline-block;
+      height: 6px;
+      background: #38bdf8;
+      border-radius: 3px;
+      vertical-align: middle;
+      margin-right: 4px;
+    }
   </style>
 </head>
 <body>
@@ -151,6 +200,10 @@ let nearestShapepoint = null;
 let vehicleScoreResult    = null;
 let vehicleScoreRequestId = 0;
 
+// confidence tracker state — mirrors the server-side table, synced on load
+// and after every "Include block score" click / reset
+let confidenceTable = [];
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 function isInCell(stop, cell) {
@@ -190,34 +243,6 @@ function bearingDegrees(lat1, lon1, lat2, lon2) {
 function angleDiff(a, b) {
   const diff = Math.abs(a - b) % 360;
   return diff > 180 ? 360 - diff : diff;
-}
-
-function arrayToCSV(data) {
-  if (!data || !data.length) return '';
-  const headers = Object.keys(data[0]);
-  const rows = data.map(row =>
-    headers.map(h => {
-      const val = row[h] ?? '';
-      const escaped = String(val).replace(/"/g, '""');
-      return /[",\n]/.test(escaped) ? `"${escaped}"` : escaped;
-    }).join(',')
-  );
-  return [headers.join(','), ...rows].join('\n');
-}
-
-function downloadCSV(data, filename) {
-  if (!data || !data.length) {
-    console.warn('[export] nothing to export');
-    return;
-  }
-  const csv  = arrayToCSV(data);
-  const blob = new Blob([csv], { type: 'text/csv' });
-  const url  = URL.createObjectURL(blob);
-  const a    = document.createElement('a');
-  a.href     = url;
-  a.download = filename;
-  a.click();
-  URL.revokeObjectURL(url);
 }
 
 function destPoint(lat, lon, bearingDeg, distM) {
@@ -318,8 +343,8 @@ const VehicleNavControl = L.Control.extend({
         <div id="nav-idx"     class="nav-index">— / —</div>
         <div id="nav-compass" class="nav-compass">Compass: —</div>
         <div id="nav-score"   class="nav-score">Best match: —</div>
-        <button class="nav-btn" id="nav-export-csv" title="Download block scores as CSV" style="margin-top:6px;width:100%;">
-          ⬇ Export BLOCK SCORE CSV
+        <button class="nav-btn" id="nav-include-confidence" title="Feed current block scores into the confidence tracker" style="margin-top:6px;width:100%;">
+          ✚ Include block score
         </button>
       </div>
       <button class="nav-btn" id="nav-forward" disabled title="Next position">&#8594;</button>
@@ -328,15 +353,7 @@ const VehicleNavControl = L.Control.extend({
     L.DomEvent.disableScrollPropagation(c);
     c.querySelector("#nav-back").addEventListener("click",    () => navigateVehicle(-1));
     c.querySelector("#nav-forward").addEventListener("click", () => navigateVehicle(+1));
-    c.querySelector("#nav-export-csv").addEventListener("click", () => {
-      if (!vehicleScoreResult || !vehicleScoreResult.blocks || vehicleScoreResult.blocks.length === 0) {
-        console.warn("[export] no block scores available for this position");
-        return;
-      }
-      const p = vehiclePoints[vehicleIndex];
-      const filename = `blocks_veh${vehicleId}_${p.time.replace(/:/g, "-")}.csv`;
-      downloadCSV(vehicleScoreResult.blocks, filename);
-    });
+    c.querySelector("#nav-include-confidence").addEventListener("click", () => includeBlockScore());
 
     this._onKeyDown = (e) => {
       const tag = document.activeElement && document.activeElement.tagName;
@@ -353,6 +370,39 @@ const VehicleNavControl = L.Control.extend({
 });
 
 new VehicleNavControl().addTo(map);
+
+// ── confidence tracker control ────────────────────────────────────────────────
+
+const ConfidenceControl = L.Control.extend({
+  options: { position: "bottomleft" },
+  onAdd(map) {
+    const c = L.DomUtil.create("div", "confidence-control");
+    c.innerHTML = `
+      <div class="confidence-header">
+        <span>Confidence Tracker</span>
+        <button id="conf-reset" title="Clear the confidence table">Reset</button>
+      </div>
+      <div id="conf-table-wrap">
+        <table id="conf-table">
+          <thead>
+            <tr>
+              <th>Block</th><th>Trip</th><th>Conf.</th><th>Hits</th><th>Miss</th>
+            </tr>
+          </thead>
+          <tbody id="conf-tbody">
+            <tr><td colspan="5" style="text-align:center;color:#94a3b8;">No blocks tracked</td></tr>
+          </tbody>
+        </table>
+      </div>
+    `;
+    L.DomEvent.disableClickPropagation(c);
+    L.DomEvent.disableScrollPropagation(c);
+    c.querySelector("#conf-reset").addEventListener("click", () => resetConfidenceTable());
+    return c;
+  },
+});
+
+new ConfidenceControl().addTo(map);
 
 // ── navigator functions ───────────────────────────────────────────────────────
 
@@ -691,8 +741,8 @@ async function scoreVehiclePosition(vp, rankedGroups) {
       "color:#fbbf24;font-weight:bold;"
     );
     if (data.trips.length > 0) {
-      console.log("Trip scores:");
-      console.table(data.trips);
+      // console.log("Trip scores:");
+      // console.table(data.trips);
       console.log("Block scores:");
       console.table(data.blocks);
     } else {
@@ -702,6 +752,88 @@ async function scoreVehiclePosition(vp, rankedGroups) {
     if (requestId !== vehicleScoreRequestId) return;
     console.error("[vehicle-score] error:", err);
     clearVehicleScore("request error");
+  }
+}
+
+// ── confidence tracker ────────────────────────────────────────────────────────
+
+async function loadConfidenceTable() {
+  try {
+    const res  = await fetch("/api/confidence");
+    const data = await res.json();
+    confidenceTable = data.table;
+    renderConfidenceTable();
+  } catch (err) {
+    console.error("[confidence] load failed:", err);
+  }
+}
+
+function renderConfidenceTable() {
+  const tbody = document.getElementById("conf-tbody");
+  if (!tbody) return;
+
+  if (!confidenceTable || confidenceTable.length === 0) {
+    tbody.innerHTML = `<tr><td colspan="5" style="text-align:center;color:#94a3b8;">No blocks tracked</td></tr>`;
+    return;
+  }
+
+  tbody.innerHTML = confidenceTable.map(r => {
+    const pct = Math.round(r.confidence * 100);
+    return `
+      <tr>
+        <td>${r.blockid}</td>
+        <td>${r.trip_id ?? "—"}</td>
+        <td><span class="conf-bar" style="width:${Math.max(pct, 2)}px;"></span>${pct}%</td>
+        <td>${r.consecutive_hits}</td>
+        <td>${r.consecutive_misses}</td>
+      </tr>`;
+  }).join("");
+}
+
+async function includeBlockScore() {
+  if (!vehicleScoreResult || !vehicleScoreResult.blocks || vehicleScoreResult.blocks.length === 0) {
+    console.warn("[confidence] no block scores available for this position — nothing to include");
+    return;
+  }
+
+  const p = vehiclePoints[vehicleIndex];
+
+  try {
+    const res = await fetch("/api/confidence/include", {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        blocks:  vehicleScoreResult.blocks,   // now carries trip_id per block
+        compass: p.compass,
+      }),
+    });
+    const data = await res.json();
+
+    confidenceTable = data.table;
+    renderConfidenceTable();
+
+    console.log(
+      `%c[confidence] included @ ${p.time} (compass ${p.compass}°) · ` +
+      `reversal=${data.reversal_fired} · evicted=${JSON.stringify(data.evicted)}`,
+      "color:#c084fc;font-weight:bold;"
+    );
+    console.log("Confidence table:");
+    console.table(confidenceTable);
+
+  } catch (err) {
+    console.error("[confidence] include failed:", err);
+  }
+}
+
+async function resetConfidenceTable() {
+  try {
+    const res  = await fetch("/api/confidence/reset", { method: "POST" });
+    const data = await res.json();
+    confidenceTable = data.table;
+    renderConfidenceTable();
+    console.log("%c[confidence] table reset", "color:#94a3b8;");
+  } catch (err) {
+    console.error("[confidence] reset failed:", err);
   }
 }
 
@@ -1202,7 +1334,7 @@ function toggleStops() {
 // ── boot ──────────────────────────────────────────────────────────────────────
 
 (async function boot() {
-  await Promise.all([loadGrid(), loadStops(), loadVehicleRoute()]);
+  await Promise.all([loadGrid(), loadStops(), loadVehicleRoute(), loadConfidenceTable()]);
   updateCurrentPosition();
   updateVehicleGridAndNearest();
   document.getElementById("loading-overlay").classList.add("hidden");
